@@ -14,7 +14,9 @@
 
 from unittest.mock import patch
 
+import torch
 from omegaconf import OmegaConf
+from tensordict import TensorDict
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer
@@ -31,6 +33,21 @@ class _StubTrainer(PPOTrainer):
 class _CustomSampler:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+
+
+class _FakeKVBatchMeta:
+    def __init__(self):
+        self.keys = ["sample-0", "sample-1"]
+        self.partition_id = "partition-0"
+        self.extra_info = {}
+
+    def __len__(self):
+        return len(self.keys)
+
+
+class _LogProbWorker:
+    def compute_log_prob(self, batch):
+        return batch
 
 
 def _trainer_with_filter_groups(filter_groups: dict, trainer_mode: str = "sync") -> _StubTrainer:
@@ -163,3 +180,39 @@ def test_builtin_filter_groups_warns_when_total_generation_limit_is_configured()
         "use max_inflight_gen_batches to bound concurrent Sync DAPO generation.",
         10,
     )
+
+
+def test_compute_old_log_prob_skips_unused_entropy():
+    trainer = _StubTrainer.__new__(_StubTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "algorithm": {"rollout_correction": {"bypass_mode": False}},
+            "actor_rollout_ref": {
+                "actor": {"calculate_entropy": False, "entropy_coeff": 0.0},
+                "rollout": {"temperature": 1.0, "calculate_log_probs": False},
+            },
+        }
+    )
+    trainer.actor_rollout_wg = _LogProbWorker()
+    batch = _FakeKVBatchMeta()
+    data = TensorDict(
+        {
+            "log_probs": torch.ones(2, 3),
+            "response_mask": torch.ones(2, 3, dtype=torch.bool),
+        },
+        batch_size=[2],
+    )
+
+    with (
+        patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get", return_value=data) as kv_batch_get,
+        patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_put", return_value=batch) as kv_batch_put,
+        patch("verl.trainer.ppo.v1.trainer_base.response_from_nested", side_effect=lambda tensor, _: tensor),
+    ):
+        metrics = {}
+        result = trainer._compute_old_log_prob(batch, metrics)
+
+    assert result is batch
+    assert batch.extra_info["calculate_entropy"] is False
+    assert kv_batch_get.call_args.kwargs["select_fields"] == ["log_probs", "response_mask"]
+    assert list(kv_batch_put.call_args.kwargs["fields"].keys()) == ["old_log_probs"]
+    assert "actor/entropy" not in metrics

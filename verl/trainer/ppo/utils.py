@@ -107,6 +107,11 @@ def need_critic(config: DictConfig) -> bool:
         return False
 
 
+def should_calculate_actor_entropy(actor_config: DictConfig) -> bool:
+    """Return whether an actor forward pass needs token-level entropy."""
+    return bool(actor_config.calculate_entropy or actor_config.entropy_coeff != 0.0)
+
+
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
     """Create a dataset.
 

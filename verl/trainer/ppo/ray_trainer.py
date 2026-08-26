@@ -58,6 +58,7 @@ from verl.trainer.ppo.utils import (
     need_reference_policy,
     need_reward_model,
     need_teacher_policy,
+    should_calculate_actor_entropy,
 )
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
@@ -1294,28 +1295,33 @@ class RayPPOTrainer:
         # step 2: convert from padding to nopadding
         batch_td = left_right_2_no_padding(batch_td)
         # step 3: add meta info
-        calculate_sum_pi_squared = self.config.actor_rollout_ref.actor.get("calculate_sum_pi_squared", False)
+        actor_config = self.config.actor_rollout_ref.actor
+        calculate_entropy = should_calculate_actor_entropy(actor_config)
+        calculate_sum_pi_squared = actor_config.get("calculate_sum_pi_squared", False)
         tu.assign_non_tensor(
             batch_td,
-            calculate_entropy=True,
+            calculate_entropy=calculate_entropy,
             calculate_sum_pi_squared=calculate_sum_pi_squared,
             compute_loss=False,
         )
         output = self.actor_rollout_wg.compute_log_prob(batch_td)
         # gather output
-        entropy = tu.get(output, "entropy")
+        entropy = tu.get(output, "entropy") if calculate_entropy else None
         log_probs = tu.get(output, "log_probs")
         routed_experts = tu.get(output, "routed_experts")
         sum_pi_squared = tu.get(output, "sum_pi_squared") if calculate_sum_pi_squared else None
 
         old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
         # step 4. No padding to padding
-        entropy = no_padding_2_padding(entropy, batch_td)
+        if entropy is not None:
+            entropy = no_padding_2_padding(entropy, batch_td)
         log_probs = no_padding_2_padding(log_probs, batch_td)
         if sum_pi_squared is not None:
             sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
         # step 5: rebuild a tensordict and convert to dataproto
-        result = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
+        result = {"old_log_probs": log_probs.float()}
+        if entropy is not None:
+            result["entropys"] = entropy.float()
         if routed_experts is not None:
             result["routed_experts"] = routed_experts
         if sum_pi_squared is not None:
@@ -1333,9 +1339,7 @@ class RayPPOTrainer:
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to no-padding
         batch_td = left_right_2_no_padding(batch_td)
-        calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
-            self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
-        )
+        calculate_entropy = should_calculate_actor_entropy(self.config.actor_rollout_ref.actor)
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
             if is_distillation_enabled(self.config.get("distillation"))
@@ -1584,21 +1588,18 @@ class RayPPOTrainer:
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            actor_config = self.config.actor_rollout_ref.actor
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys,
-                                loss_mask=response_masks,
-                                loss_agg_mode=actor_config.loss_agg_mode,
-                                loss_scale_factor=actor_config.loss_scale_factor,
-                            )
-                            old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item(),
-                                "perf/mfu/actor_infer": old_log_prob_mfu,
-                            }
+                            old_log_prob_metrics = {"perf/mfu/actor_infer": old_log_prob_mfu}
+                            if "entropys" in old_log_prob.batch:
+                                entropys = old_log_prob.batch.pop("entropys")
+                                actor_config = self.config.actor_rollout_ref.actor
+                                entropy_agg = agg_loss(
+                                    loss_mat=entropys,
+                                    loss_mask=batch.batch["response_mask"],
+                                    loss_agg_mode=actor_config.loss_agg_mode,
+                                    loss_scale_factor=actor_config.loss_scale_factor,
+                                )
+                                old_log_prob_metrics["actor/entropy"] = entropy_agg.detach().item()
                             metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
                                     "Detected conflicting router replay configuration: "
