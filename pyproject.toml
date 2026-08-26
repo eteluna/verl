@@ -82,7 +82,7 @@ flash-attn-cu130torch211 = ["flash-attn==2.8.3"]
 # every disaggregated weight-sync engine (nccl / nixl / delta_sharded) imports
 # it; and Megatron MoE all-to-all uses it directly. Without it the engine module
 # fails to import and the backend never reaches CheckpointEngineRegistry.
-cupy-cu130 = ["cupy-cuda13x==14.0.1"]
+cupy-cu130 = ["cupy-cuda13x==14.2.0"]
 
 # ---- inference backends ----------------------------------------------------
 vllm = [
