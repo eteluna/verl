@@ -86,6 +86,51 @@ def validate_config(
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
+    rollout_config = config.actor_rollout_ref.rollout
+    specified_token_config = rollout_config.get("specified_token_logprobs", None)
+    specified_token_logprobs_enabled = (
+        specified_token_config is not None and specified_token_config.get("token_ids", None) is not None
+    )
+    if specified_token_logprobs_enabled:
+        reward_config = getattr(config, "reward", None)
+        if reward_config is None:
+            raise ValueError("specified-token logprobs require the reward configuration")
+        reward_model_config = reward_config.get("reward_model", None)
+        if reward_model_config is None:
+            raise ValueError("specified-token logprobs require reward.reward_model configuration")
+        reward_num_workers = reward_config.get("num_workers", None)
+        if type(reward_num_workers) is not int or reward_num_workers <= 0:
+            raise ValueError("specified-token logprobs require reward.num_workers to be a positive Python integer")
+        reward_model_enabled = reward_model_config.get("enable", False)
+        if reward_model_enabled and not reward_model_config.get("enable_resource_pool", False):
+            raise NotImplementedError(
+                "specified-token logprobs require streaming reward workers; an enabled colocated reward model "
+                "with reward.reward_model.enable_resource_pool=False is not supported"
+            )
+        custom_reward_config = reward_config.get("custom_reward_function", {}) or {}
+        if reward_model_enabled and custom_reward_config.get("path", None) is None:
+            raise NotImplementedError(
+                "specified-token logprobs cannot be consumed by the built-in discriminative reward model path; "
+                "configure reward.custom_reward_function"
+            )
+
+        rollout_correction = config.algorithm.get("rollout_correction", None)
+        active_correction_options = []
+        if rollout_correction is not None:
+            if rollout_correction.get("rollout_is", None) is not None:
+                active_correction_options.append("rollout_is")
+            if rollout_correction.get("rollout_rs", None) is not None:
+                active_correction_options.append("rollout_rs")
+            if rollout_correction.get("bypass_mode", False):
+                active_correction_options.append("bypass_mode")
+        if active_correction_options:
+            raise ValueError(
+                "specified-token logprobs cannot be combined with active rollout correction "
+                f"({', '.join(active_correction_options)}): rollout.logprobs_mode='raw_logprobs' is engine-global "
+                "and changes the sampled rollout_log_probs consumed by rollout correction and bypass mode. "
+                "Disable rollout correction or specified-token logprobs."
+            )
+
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":
             model_parallel_size = (

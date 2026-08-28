@@ -315,6 +315,16 @@ actor_rollout_ref:
     enable_chunked_prefill: true
     enable_prefix_caching: true
     logprobs_mode: processed_logprobs
+    specified_token_logprobs:
+      _target_: verl.workers.config.SpecifiedTokenLogprobsConfig
+      token_ids: null
+      mode: raw_logprobs
+      positions: null
+      consumers:
+      - reward
+      max_capture_positions: 4096
+      max_requested_positions: 128
+      max_payload_bytes_per_sample: 1048576
     scheduling_policy: fcfs
     load_format: dummy
     layered_summon: false

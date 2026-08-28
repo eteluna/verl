@@ -236,6 +236,22 @@ class LLMServerClient:
             return request_id
         return uuid4().hex
 
+    def _specified_token_logprobs_enabled(self) -> bool:
+        """Whether the full config requests specified-token response logprobs."""
+        actor_rollout_ref_config = getattr(self.config, "actor_rollout_ref", None)
+        rollout_config = getattr(actor_rollout_ref_config, "rollout", None)
+        specified_token_config = (
+            rollout_config.get("specified_token_logprobs")
+            if hasattr(rollout_config, "get")
+            else getattr(rollout_config, "specified_token_logprobs", None)
+        )
+        specified_token_ids = (
+            specified_token_config.get("token_ids")
+            if hasattr(specified_token_config, "get")
+            else getattr(specified_token_config, "token_ids", None)
+        )
+        return specified_token_ids is not None
+
     @rollout_trace_op
     async def generate(
         self,
@@ -313,6 +329,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 every 1 second instead of raising immediately.
         """
         super().__init__(config=config, load_balancer_handle=load_balancer_handle, **kwargs)
+        if self._specified_token_logprobs_enabled():
+            raise NotImplementedError(
+                "specified-token response logprobs do not support FullyAsync/partial-resume generation."
+            )
         self._only_hybrid = only_hybrid
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
@@ -369,6 +389,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         Returns:
             TokenOutput: token output
         """
+        if self._specified_token_logprobs_enabled():
+            raise NotImplementedError(
+                "specified-token response logprobs do not support FullyAsync/partial-resume generation."
+            )
+
         prompt_ids = normalize_token_ids(prompt_ids)
 
         limit_key = None

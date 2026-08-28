@@ -321,14 +321,31 @@ def _trace_field(value, field_name):
     return getattr(value, field_name, None)
 
 
+_TRACE_EXCLUDED_OUTPUT_FIELDS = frozenset({"specified_token_logprobs"})
+
+
 def _trace_output_copy(output):
     if isinstance(output, BaseModel):
-        return output.model_dump()
+        return output.model_dump(exclude=_TRACE_EXCLUDED_OUTPUT_FIELDS)
     if isinstance(output, dict):
-        return dict(output)
+        output_copy = dict(output)
+        for field_name in _TRACE_EXCLUDED_OUTPUT_FIELDS:
+            output_copy.pop(field_name, None)
+        return output_copy
     if hasattr(output, "__dict__"):
-        return dict(vars(output))
+        output_copy = dict(vars(output))
+        for field_name in _TRACE_EXCLUDED_OUTPUT_FIELDS:
+            output_copy.pop(field_name, None)
+        return output_copy
     return None
+
+
+def _trace_safe_output(output):
+    """Remove transient consumer payloads before handing output to a trace backend."""
+    if not any(_trace_field(output, field_name) is not None for field_name in _TRACE_EXCLUDED_OUTPUT_FIELDS):
+        return output
+    output_copy = _trace_output_copy(output)
+    return output if output_copy is None else output_copy
 
 
 async def _add_token2text(instance, inputs, output):
@@ -385,12 +402,13 @@ def rollout_trace_op(func):
             call = tracer.create_call(op=func.__qualname__, inputs=inputs, attributes=cur_attributes)
             try:
                 result = await func(self, *args, **kwargs)
+                trace_result = _trace_safe_output(result)
 
                 if enable_token2text:
-                    _result = await _add_token2text(self, inputs, result)
+                    _result = await _add_token2text(self, inputs, trace_result)
                     tracer.finish_call(call, output=_result)
                 else:
-                    tracer.finish_call(call, output=result)
+                    tracer.finish_call(call, output=trace_result)
 
                 return result
 
@@ -403,21 +421,23 @@ def rollout_trace_op(func):
             with mlflow.start_span(name=func.__qualname__) as span:
                 span.set_inputs(inputs)
                 result = await func(self, *args, **kwargs)
+                trace_result = _trace_safe_output(result)
                 if enable_token2text:
-                    _result = await _add_token2text(self, inputs, result)
+                    _result = await _add_token2text(self, inputs, trace_result)
                     span.set_outputs(_result)
                 else:
-                    span.set_outputs(result)
+                    span.set_outputs(trace_result)
 
             return result
         elif backend == "trackio":
             try:
                 result = await func(self, *args, **kwargs)
+                trace_result = _trace_safe_output(result)
                 if enable_token2text:
-                    _result = await _add_token2text(self, inputs, result)
+                    _result = await _add_token2text(self, inputs, trace_result)
                     _log_trackio_trace(func.__qualname__, inputs, output=_result)
                 else:
-                    _log_trackio_trace(func.__qualname__, inputs, output=result)
+                    _log_trackio_trace(func.__qualname__, inputs, output=trace_result)
                 return result
             except Exception as e:
                 _log_trackio_trace(func.__qualname__, inputs, exception=e)
@@ -448,7 +468,7 @@ def rollout_trace_op(func):
             call = tracer.create_call(op=func.__qualname__, inputs=inputs, attributes=cur_attributes)
             try:
                 result = func(self, *args, **kwargs)
-                tracer.finish_call(call, output=result)
+                tracer.finish_call(call, output=_trace_safe_output(result))
                 return result
             except Exception as e:
                 tracer.finish_call(call, exception=e)
@@ -460,7 +480,7 @@ def rollout_trace_op(func):
         elif backend == "trackio":
             try:
                 result = func(self, *args, **kwargs)
-                _log_trackio_trace(func.__qualname__, inputs, output=result)
+                _log_trackio_trace(func.__qualname__, inputs, output=_trace_safe_output(result))
                 return result
             except Exception as e:
                 _log_trackio_trace(func.__qualname__, inputs, exception=e)

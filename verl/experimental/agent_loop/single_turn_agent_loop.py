@@ -19,6 +19,7 @@ from uuid import uuid4
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.workers.rollout.logprobs import SPECIFIED_TOKEN_LOGPROBS_KEY, finalize_specified_token_logprobs
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -61,7 +62,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             request_id = f"det-{priority}" if getattr(self.rollout_config, "full_determinism", False) else uuid4().hex
-            output: TokenOutput = await self.server_manager.generate(
+            token_output: TokenOutput = await self.server_manager.generate(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
@@ -72,36 +73,51 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 priority=priority,
             )
         if metrics.get("num_preempted") is None:
-            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+            metrics["num_preempted"] = token_output.num_preempted if token_output.num_preempted is not None else -1
 
         merge_result, response_mask, response_logprobs = await self.ct_merge_assistant_token(
             prompt_ids,
-            output.token_ids,
+            token_output.token_ids,
             [],
-            [] if output.log_probs else None,
-            assistant_logprobs=output.log_probs if output.log_probs else None,
+            [] if token_output.log_probs else None,
+            assistant_logprobs=token_output.log_probs if token_output.log_probs else None,
         )
         response_ids = merge_result.token_ids[-len(response_mask) :] if response_mask else []
         prompt_ids = merge_result.token_ids[: len(merge_result.token_ids) - len(response_mask)]
+        final_response_ids = response_ids[: self.response_length]
 
-        output: AgentLoopOutput = AgentLoopOutput(
+        specified_output_fields: dict[str, Any] = {}
+        specified_token_config = self.rollout_config.get("specified_token_logprobs")
+        if specified_token_config is not None and specified_token_config.get("token_ids") is not None:
+            if token_output.specified_token_logprobs is None:
+                raise RuntimeError("Rollout backend did not return specified-token logprobs for an enabled request.")
+            specified_output_fields[SPECIFIED_TOKEN_LOGPROBS_KEY] = finalize_specified_token_logprobs(
+                token_output.specified_token_logprobs,
+                configured_positions=specified_token_config.positions,
+                configured_token_ids=specified_token_config.token_ids,
+                backend_response_ids=token_output.token_ids,
+                final_response_ids=final_response_ids,
+            )
+
+        agent_output = AgentLoopOutput(
             prompt_ids=prompt_ids,
-            response_ids=response_ids[: self.response_length],
+            response_ids=final_response_ids,
             response_mask=response_mask[: self.response_length],
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
             routed_experts=(
-                output.routed_experts[: len(prompt_ids) + self.response_length]
-                if output.routed_experts is not None
+                token_output.routed_experts[: len(prompt_ids) + self.response_length]
+                if token_output.routed_experts is not None
                 else None
             ),
             multi_modal_data=multi_modal_data,
             mm_processor_kwargs=mm_processor_kwargs,
             num_turns=2,
             metrics=metrics,
-            extra_fields=output.extra_fields,
+            extra_fields=token_output.extra_fields,
+            **specified_output_fields,
         )
 
         # keeping the schema consistent with tool_agent_loop
-        output.extra_fields.update({"turn_scores": [], "tool_rewards": []})
+        agent_output.extra_fields.update({"turn_scores": [], "tool_rewards": []})
 
-        return output
+        return agent_output

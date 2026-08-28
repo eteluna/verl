@@ -15,7 +15,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
-from omegaconf import MISSING, DictConfig, OmegaConf
+from omegaconf import MISSING, DictConfig, ListConfig, OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
@@ -30,6 +30,7 @@ __all__ = [
     "TraceConfig",
     "ServerConfig",
     "PrometheusConfig",
+    "SpecifiedTokenLogprobsConfig",
     "RolloutConfig",
     "CheckpointEngineConfig",
 ]
@@ -141,6 +142,101 @@ class CheckpointEngineConfig(BaseConfig):
     custom_backend_module: Optional[str] = None
 
 
+_SPECIFIED_TOKEN_LOGPROBS_CONSUMERS = frozenset({"reward", "actor_auxiliary"})
+_MAX_SPECIFIED_TOKEN_IDS = 128
+
+
+@dataclass
+class SpecifiedTokenLogprobsConfig(BaseConfig):
+    """Optional capture of exact-token log probabilities at fixed response positions."""
+
+    token_ids: Optional[list[int]] = None
+    mode: str = "raw_logprobs"
+    positions: Optional[list[int]] = None
+    consumers: list[str] = field(default_factory=lambda: ["reward"])
+    max_capture_positions: int = 4096
+    max_requested_positions: int = 128
+    max_payload_bytes_per_sample: int = 1048576
+
+    @property
+    def enabled(self) -> bool:
+        """Whether exact-token logprob capture is configured."""
+        return self.token_ids is not None
+
+    def __post_init__(self) -> None:
+        for field_name in ("token_ids", "positions", "consumers"):
+            value = getattr(self, field_name)
+            if isinstance(value, ListConfig):
+                object.__setattr__(self, field_name, list(value))
+
+        if (self.token_ids is None) != (self.positions is None):
+            raise ValueError("specified_token_logprobs.token_ids and positions must be set together")
+        if self.mode != "raw_logprobs":
+            raise ValueError("specified_token_logprobs.mode must be 'raw_logprobs'")
+
+        for field_name in (
+            "max_capture_positions",
+            "max_requested_positions",
+            "max_payload_bytes_per_sample",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"specified_token_logprobs.{field_name} must be a positive Python integer")
+
+        if not isinstance(self.consumers, list) or not self.consumers:
+            raise ValueError("specified_token_logprobs.consumers must be a non-empty list")
+        if any(not isinstance(consumer, str) or not consumer for consumer in self.consumers):
+            raise ValueError("specified_token_logprobs.consumers must contain non-empty strings")
+        if len(set(self.consumers)) != len(self.consumers):
+            raise ValueError("specified_token_logprobs.consumers must be unique")
+        unknown_consumers = set(self.consumers) - _SPECIFIED_TOKEN_LOGPROBS_CONSUMERS
+        if unknown_consumers:
+            raise ValueError(
+                "unknown specified_token_logprobs consumers: "
+                f"{sorted(unknown_consumers)}; supported registry entries are "
+                f"{sorted(_SPECIFIED_TOKEN_LOGPROBS_CONSUMERS)}"
+            )
+        if "actor_auxiliary" in self.consumers:
+            raise NotImplementedError(
+                "specified_token_logprobs consumer 'actor_auxiliary' is reserved but not implemented in this revision"
+            )
+
+        if not self.enabled:
+            return
+
+        assert self.token_ids is not None
+        assert self.positions is not None
+        if not isinstance(self.token_ids, list) or not self.token_ids:
+            raise ValueError("specified_token_logprobs.token_ids must be a non-empty list")
+        for token_id in self.token_ids:
+            if type(token_id) is not int:
+                raise ValueError("specified_token_logprobs.token_ids must contain only Python integers")
+            if token_id < 0:
+                raise ValueError("specified_token_logprobs.token_ids must be non-negative")
+        if len(set(self.token_ids)) != len(self.token_ids):
+            raise ValueError("specified_token_logprobs.token_ids must be unique while preserving caller order")
+        if len(self.token_ids) > _MAX_SPECIFIED_TOKEN_IDS:
+            raise ValueError(
+                "specified_token_logprobs.token_ids exceeds the vLLM exact-token limit: "
+                f"{len(self.token_ids)} > {_MAX_SPECIFIED_TOKEN_IDS}"
+            )
+
+        if not isinstance(self.positions, list) or not self.positions:
+            raise ValueError("specified_token_logprobs.positions must be a non-empty list")
+        for position in self.positions:
+            if type(position) is not int:
+                raise ValueError("specified_token_logprobs.positions must contain only Python integers")
+            if position < 0:
+                raise ValueError("specified_token_logprobs.positions must be non-negative")
+        if any(left >= right for left, right in zip(self.positions, self.positions[1:], strict=False)):
+            raise ValueError("specified_token_logprobs.positions must be unique and strictly increasing")
+        if len(self.positions) > self.max_requested_positions:
+            raise ValueError(
+                "specified_token_logprobs.positions exceeds max_requested_positions: "
+                f"{len(self.positions)} > {self.max_requested_positions}"
+            )
+
+
 @dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {
@@ -218,6 +314,8 @@ class RolloutConfig(BaseConfig):
 
     calculate_log_probs: bool = False
 
+    specified_token_logprobs: SpecifiedTokenLogprobsConfig = field(default_factory=SpecifiedTokenLogprobsConfig)
+
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
     trace: TraceConfig = field(default_factory=TraceConfig)
@@ -275,6 +373,27 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        # Hydra normally instantiates nested targets recursively. Direct callers
+        # and some Ray boundaries may still provide a dict/DictConfig, so keep
+        # this public config boundary explicit and fail closed.
+        if isinstance(self.specified_token_logprobs, dict):
+            object.__setattr__(
+                self,
+                "specified_token_logprobs",
+                SpecifiedTokenLogprobsConfig(**self.specified_token_logprobs),
+            )
+        elif not isinstance(self.specified_token_logprobs, SpecifiedTokenLogprobsConfig):
+            if not isinstance(self.specified_token_logprobs, DictConfig):
+                raise TypeError(
+                    "rollout.specified_token_logprobs must be dict, DictConfig, or "
+                    f"SpecifiedTokenLogprobsConfig; got {type(self.specified_token_logprobs).__name__}."
+                )
+            object.__setattr__(
+                self,
+                "specified_token_logprobs",
+                SpecifiedTokenLogprobsConfig(**OmegaConf.to_container(self.specified_token_logprobs, resolve=True)),
+            )
+
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(
@@ -340,3 +459,62 @@ class RolloutConfig(BaseConfig):
             raise ValueError(
                 f"rollout.disaggregation.enabled=True requires rollout.name in ('sglang', 'vllm'); got {self.name!r}."
             )
+
+        specified = self.specified_token_logprobs
+        if specified.enabled:
+            assert specified.positions is not None
+            assert specified.token_ids is not None
+            if self.name != "vllm":
+                raise ValueError("specified_token_logprobs is currently supported only by rollout.name='vllm'")
+            if self.logprobs_mode != "raw_logprobs":
+                raise ValueError(
+                    "specified_token_logprobs requires rollout.logprobs_mode='raw_logprobs', "
+                    f"got {self.logprobs_mode!r}"
+                )
+            if self.multi_turn.get("enable", False):
+                raise NotImplementedError("specified_token_logprobs does not yet support multi-turn rollout")
+            if self.agent.get("default_agent_loop", "single_turn_agent") != "single_turn_agent":
+                raise NotImplementedError(
+                    "specified_token_logprobs currently requires rollout.agent.default_agent_loop='single_turn_agent'"
+                )
+            if self.agent.get("agent_loop_config_path", None) is not None:
+                raise NotImplementedError(
+                    "specified_token_logprobs does not yet support rollout.agent.agent_loop_config_path"
+                )
+            if self.agent.get("agent_loop_manager_class", None) is not None:
+                raise NotImplementedError(
+                    "specified_token_logprobs does not yet support rollout.agent.agent_loop_manager_class"
+                )
+            if self.mtp is not None and self.mtp.get("enable_rollout", False):
+                raise NotImplementedError("specified_token_logprobs does not yet support speculative decoding")
+            if self.disaggregation.enabled:
+                raise NotImplementedError("specified_token_logprobs does not yet support prefill-decode disaggregation")
+            if self.trace is not None and self.trace.get("backend", None) is not None:
+                raise NotImplementedError(
+                    "specified_token_logprobs does not yet support rollout tracing because the trace backend "
+                    "would observe the transient payload before reward consumption"
+                )
+            if type(self.response_length) is not int or self.response_length <= 0:
+                raise ValueError("specified_token_logprobs requires rollout.response_length to be a positive integer")
+            if self.response_length > specified.max_capture_positions:
+                raise ValueError(
+                    "rollout.response_length exceeds specified_token_logprobs.max_capture_positions: "
+                    f"{self.response_length} > {specified.max_capture_positions}"
+                )
+            if specified.positions[-1] >= self.response_length:
+                raise ValueError(
+                    "specified_token_logprobs.positions must be smaller than rollout.response_length, "
+                    f"got last position {specified.positions[-1]} and response_length {self.response_length}"
+                )
+
+            num_positions = len(specified.positions)
+            num_token_ids = len(specified.token_ids)
+            # The sparse payload owns an int32 [P] position array and a
+            # float32 [P, M] logprob matrix. Provenance stays scalar/tuple data.
+            sparse_ndarray_bytes = num_positions * 4 + num_positions * num_token_ids * 4
+            if sparse_ndarray_bytes > specified.max_payload_bytes_per_sample:
+                raise ValueError(
+                    "specified_token_logprobs sparse ndarray payload exceeds "
+                    "max_payload_bytes_per_sample: "
+                    f"{sparse_ndarray_bytes} > {specified.max_payload_bytes_per_sample}"
+                )

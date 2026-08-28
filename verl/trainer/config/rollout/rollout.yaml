@@ -92,6 +92,37 @@ enable_prefix_caching: True
 # logprobs mode for rollout logprobs
 logprobs_mode: processed_logprobs
 
+# Optional exact-token log probabilities at fixed response positions.
+# Set token_ids and positions together to enable. The first revision supports
+# only raw-logprob, single-turn vLLM rollout and the reward consumer.
+specified_token_logprobs:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.SpecifiedTokenLogprobsConfig
+
+  # Caller-ordered token IDs whose full-vocabulary log probabilities are requested (maximum 128).
+  # null disables capture and requires positions to also be null.
+  token_ids: null
+
+  # Logprob semantics. Only raw_logprobs is supported in this revision.
+  mode: raw_logprobs
+
+  # Unique, strictly increasing, zero-based response positions.
+  # Positions beyond a short realized response are omitted from the typed payload.
+  positions: null
+
+  # Registered payload consumers. actor_auxiliary is reserved for a future revision.
+  consumers: [reward]
+
+  # Maximum dense response positions that a backend may capture before sparse gathering.
+  max_capture_positions: 4096
+
+  # Maximum number of configured response positions.
+  max_requested_positions: 128
+
+  # Maximum sparse ndarray bytes transported per sample.
+  max_payload_bytes_per_sample: 1048576
+
 # scheduling policy for vllm rollout
 scheduling_policy: fcfs
 

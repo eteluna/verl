@@ -69,6 +69,7 @@ from verl.workers.config import (
     RolloutConfig,
 )
 from verl.workers.rollout.llm_server import LLMServerClient
+from verl.workers.rollout.logprobs import SPECIFIED_TOKEN_LOGPROBS_KEY, SpecifiedTokenLogprobs
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -96,6 +97,8 @@ class AgentLoopOutput(BaseModel):
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
+    specified_token_logprobs: Optional[SpecifiedTokenLogprobs] = None
+    """Log probabilities for configured token ids at configured response positions."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
@@ -113,7 +116,11 @@ class AgentLoopOutput(BaseModel):
 
     def as_dict(self) -> dict[str, Any]:
         """Convert agent loop output to a dictionary."""
-        output = self.model_dump(exclude_unset=True)
+        # Raw rollout payloads are transient consumer inputs. In particular, the
+        # v1 path persists every field returned here to TransferQueue, so allowing
+        # this object through would implicitly expose it to actor workers. Future
+        # actor-side consumers must explicitly materialize their tensor contract.
+        output = self.model_dump(exclude_unset=True, exclude={SPECIFIED_TOKEN_LOGPROBS_KEY})
 
         output["prompts"] = torch.tensor(output.pop("prompt_ids"), dtype=torch.int64)
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
@@ -645,6 +652,12 @@ class AgentLoopWorker:
             name="agent_loop",
             trace=trace,
         ):
+            specified_token_config = getattr(getattr(self, "rollout_config", None), "specified_token_logprobs", None)
+            if getattr(specified_token_config, "enabled", False) and agent_name != "single_turn_agent":
+                raise NotImplementedError(
+                    "specified-token response logprobs currently support only the single_turn_agent loop; "
+                    f"got agent_name={agent_name!r}."
+                )
             assert agent_name in _agent_loop_registry, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
             )
@@ -939,6 +952,24 @@ class AgentLoopWorker:
         enable_async_reward = self.reward_loop_worker_handles is not None
 
         final_output = outputs[-1]
+        has_specified_token_logprobs = any(output.specified_token_logprobs is not None for output in outputs)
+        if has_specified_token_logprobs:
+            if final_output.reward_score is not None:
+                raise RuntimeError(
+                    "specified-token response logprobs were requested for the reward consumer, but the agent loop "
+                    "already supplied reward_score, so the configured reward consumer would not run."
+                )
+            if not enable_async_reward:
+                raise NotImplementedError(
+                    "specified-token response logprobs currently require streaming reward workers; "
+                    "colocated/post-rollout reward computation is not supported."
+                )
+            if self.config.reward.reward_model.enable and self.config.reward.custom_reward_function.path is None:
+                raise NotImplementedError(
+                    "specified-token response logprobs cannot be consumed by the built-in discriminative reward "
+                    "model path; configure reward.custom_reward_function or disable specified-token logprobs."
+                )
+
         if final_output.reward_score is None and enable_async_reward:
             timing = {}
             with simple_timer("compute_score", timing):
@@ -987,6 +1018,20 @@ class AgentLoopWorker:
                     "prompt_len": np.array([len(o.prompt_ids) for o in outputs]),
                     "response_len": np.array([len(o.response_ids) for o in outputs]),
                 }
+                if has_specified_token_logprobs:
+                    original_extra_info = kwargs.get("extra_info") or {}
+                    reward_extra_infos = np.empty(n, dtype=object)
+                    for index, output in enumerate(outputs):
+                        reward_extra_info = dict(original_extra_info)
+                        if output.specified_token_logprobs is not None:
+                            reward_extra_info[SPECIFIED_TOKEN_LOGPROBS_KEY] = (
+                                output.specified_token_logprobs.model_dump(mode="python")
+                            )
+                        reward_extra_infos[index] = reward_extra_info
+                    # Replace the aliased input dictionaries only in this transient
+                    # reward DataProto. The top-level kwargs mapping and
+                    # output.extra_fields are not mutated; nested values remain shared.
+                    non_tensor_batch["extra_info"] = reward_extra_infos
 
                 data = DataProto(
                     batch=batch,
@@ -995,7 +1040,14 @@ class AgentLoopWorker:
                 selected_reward_loop_worker_handle = random.choice(self.reward_loop_worker_handles)
                 result = await selected_reward_loop_worker_handle.compute_score.remote(data)
                 final_output.reward_score = result["reward_score"]
-                final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+                if has_specified_token_logprobs:
+                    reward_extra_info = dict(result["reward_extra_info"])
+                    reward_extra_info.pop(SPECIFIED_TOKEN_LOGPROBS_KEY, None)
+                    for output in outputs:
+                        output.specified_token_logprobs = None
+                else:
+                    reward_extra_info = result["reward_extra_info"]
+                final_output.extra_fields["reward_extra_info"] = reward_extra_info
             final_output.metrics.compute_score = timing["compute_score"]
 
     async def _compute_teacher_logprobs(
