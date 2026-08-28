@@ -274,6 +274,11 @@ actor_rollout_ref:
     enable_chunked_prefill: true
     enable_prefix_caching: true
     logprobs_mode: processed_logprobs
+    selected_token_logprobs:
+      _target_: verl.workers.config.SelectedTokenLogprobsConfig
+      token_ids: null
+      positions: null
+      max_payload_bytes_per_sample: 4194304
     scheduling_policy: fcfs
     load_format: dummy
     layered_summon: false

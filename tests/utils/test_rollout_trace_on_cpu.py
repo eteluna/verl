@@ -125,6 +125,11 @@ class GeneratedTokenOutput(BaseModel):
     token_ids: list[int]
 
 
+class GeneratedTokenOutputWithTransientPayload(BaseModel):
+    token_ids: list[int]
+    selected_token_logprobs: object
+
+
 class FakeTokenizer:
     def decode(self, token_ids):
         return "decoded:" + ",".join(str(token_id) for token_id in token_ids)
@@ -137,6 +142,15 @@ class LLMGenerateTraceClass:
     @rollout_trace_op
     async def generate(self, *, prompt_ids):
         return GeneratedTokenOutput(token_ids=[3, 4])
+
+
+class TransientPayloadTraceClass:
+    @rollout_trace_op
+    async def generate(self):
+        return GeneratedTokenOutputWithTransientPayload(
+            token_ids=[3, 4],
+            selected_token_logprobs={"must_not_escape": True},
+        )
 
 
 async def test_rollout_trace_on_untraced_class():
@@ -162,6 +176,17 @@ async def test_rollout_trace_with_tracer(mock_weave_client):
 
     mock_call = mock_weave_client.create_call.return_value
     mock_weave_client.finish_call.assert_called_once_with(mock_call, output=result)
+
+
+async def test_rollout_trace_excludes_transient_selected_token_logprobs(mock_weave_client):
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="weave")
+    instance = TransientPayloadTraceClass()
+
+    result = await instance.generate()
+
+    assert result.selected_token_logprobs == {"must_not_escape": True}
+    mock_call = mock_weave_client.create_call.return_value
+    mock_weave_client.finish_call.assert_called_once_with(mock_call, output={"token_ids": [3, 4]})
 
 
 async def test_token2text_decodes_llm_generate_input_and_output(mock_mlflow_client):
