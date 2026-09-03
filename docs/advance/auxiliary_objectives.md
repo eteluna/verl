@@ -14,8 +14,9 @@ order, normalizes it over the whole mini-batch, applies the coefficient once, an
 metrics under `actor/aux/<name>/`. With the default empty list nothing changes.
 
 Typical uses: calibration of the probability the policy assigns to a few label tokens, a supervised
-term on part of the batch, an auxiliary-prediction loss. Rewards cannot express these: a reward only
-changes advantages, it cannot put a gradient through the current-policy outputs.
+term on part of the batch, an auxiliary-prediction loss. A reward cannot express these: it only changes
+the advantages of the sampled tokens, so it cannot directly optimize a function of the current full
+output distribution.
 
 Objectives only read `model_output`. When a term needs more than `log_probs`, the engine produces it
 from configuration (see *Selected-token log-probabilities* below); plugins never touch the full logits.
