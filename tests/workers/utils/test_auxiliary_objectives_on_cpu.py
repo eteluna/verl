@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the actor-side auxiliary objective composer (no distributed, no model)."""
+"""Unit tests for the actor-side auxiliary objective composer (no model; distributed calls stubbed)."""
 
 import textwrap
 from types import SimpleNamespace
@@ -23,6 +23,7 @@ from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import AuxiliaryObjectiveConfig
+from verl.workers.utils import auxiliary_objectives as aux
 from verl.workers.utils.auxiliary_objectives import (
     AUX_GLOBAL_STATS_KEY,
     ActorObjectiveResult,
@@ -56,6 +57,7 @@ class SquareObjective(BaseActorAuxiliaryObjective):
 
     required_batch_keys = ("mask",)
     required_model_output_keys = ("log_probs",)
+    stat_names = ("n",)
 
     def prepare_batch(self, data):
         return {"n": data["mask"].sum()}
@@ -71,6 +73,7 @@ class ExpObjective(BaseActorAuxiliaryObjective):
     """loss_sum = sum(exp(log_probs)), normalized by sequence count."""
 
     required_model_output_keys = ("log_probs",)
+    stat_names = ("seqs",)
 
     def prepare_batch(self, data):
         return {"seqs": float(data.batch_size[0])}
@@ -83,8 +86,56 @@ def _composer(*specs):
     return AuxiliaryLossComposer(base_loss_fn=_base_loss, objectives=list(specs), loss_agg_mode="token-mean")
 
 
-def _spec(name, obj, weight=1.0):
-    return LoadedAuxiliaryObjective(name=name, weight=weight, objective=obj)
+def _spec(name, obj, weight=1.0, metrics_only=False):
+    return LoadedAuxiliaryObjective(name=name, weight=weight, objective=obj, metrics_only=metrics_only)
+
+
+@pytest.fixture
+def fake_dist(monkeypatch):
+    """Pretend a single-rank process group exists: all_reduce/all_gather become local no-ops."""
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: 1)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, *a, **k: None)
+
+    def all_gather_object(out, obj, *a, **k):
+        out[0] = obj
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(aux, "get_device_id", lambda: "cpu")
+
+
+def _objective_file(tmp_path, body, name="objectives.py"):
+    path = tmp_path / name
+    path.write_text(textwrap.dedent(body))
+    return str(path)
+
+
+SQUARE_SRC = """
+    from verl.workers.utils.auxiliary_objectives import ActorObjectiveResult, BaseActorAuxiliaryObjective
+
+    class Obj(BaseActorAuxiliaryObjective):
+        required_batch_keys = ("mask",)
+        required_model_output_keys = ("log_probs",)
+        stat_names = ("n",)
+        def __init__(self, scale=1.0):
+            self.scale = scale
+        def prepare_batch(self, data):
+            return {"n": data["mask"].sum()}
+        def compute(self, *, model_output, data, context):
+            loss_sum = (model_output["log_probs"] ** 2 * data["mask"]).sum() * self.scale
+            return ActorObjectiveResult(loss_sum=loss_sum, normalizer="n")
+
+    def build_objective(scale=1.0):
+        return Obj(scale)
+
+    def build_needs_entropy():
+        o = Obj()
+        o.required_model_output_keys = ("log_probs", "entropy")
+        return o
+
+    def build_broken():
+        return object()
+    """
 
 
 def test_empty_config_returns_base_loss_unchanged():
@@ -139,6 +190,28 @@ def test_normalization_is_invariant_to_micro_batch_split():
     torch.testing.assert_close(whole_aux, split_aux)
 
 
+def test_stats_are_packed_in_static_schema_order_and_reduced_once(fake_dist, monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, *a, **k: calls.append(tensor.clone()))
+    data = _data()
+    composer = _composer(_spec("sq", SquareObjective()), _spec("ex", ExpObjective()))
+    composer.prepare_global_stats(data)
+    assert len(calls) == 1
+    assert calls[0].tolist() == [B * T, float(B)]  # (sq, n) then (ex, seqs): configuration order
+    stats = tu.get_non_tensor_data(data, key=AUX_GLOBAL_STATS_KEY, default=None)
+    assert stats == {"sq": {"n": float(B * T)}, "ex": {"seqs": float(B)}}
+
+
+def test_prepare_batch_must_return_exactly_the_declared_stats():
+    class Drifting(SquareObjective):
+        def prepare_batch(self, data):
+            return {"n": 1.0, "surprise": 2.0}
+
+    composer = _composer(_spec("d", Drifting()))
+    with pytest.raises(ValueError, match="schema must be static"):
+        composer.prepare_global_stats(_data())
+
+
 def test_zero_normalizer_is_inactive_and_finite():
     data = _data(mask=torch.zeros(B, T))
     composer = _composer(_spec("sq", SquareObjective(), 1.0))
@@ -150,6 +223,18 @@ def test_zero_normalizer_is_inactive_and_finite():
     assert loss.requires_grad
     loss.backward()
     assert torch.isfinite(out["log_probs"].grad).all()
+
+
+def test_metrics_only_objective_reports_but_never_contributes():
+    data = _data()
+    composer = _composer(_spec("sq", SquareObjective(), weight=0.0, metrics_only=True))
+    composer.prepare_global_stats(data)
+    out = _model_output()
+    loss, metrics = composer(model_output=out, data=data)
+    torch.testing.assert_close(loss, _base_loss(out, data)[0])
+    assert metrics["actor/aux/sq/loss"].aggregate() > 0
+    assert metrics["actor/aux/sq/weighted_loss"].aggregate() == 0.0
+    assert metrics["actor/aux/sq/active"].aggregate() == 1.0
 
 
 def test_no_grad_pass_skips_objectives():
@@ -188,6 +273,8 @@ def test_missing_prepare_stage_is_reported():
 
 
 class _Broken(BaseActorAuxiliaryObjective):
+    stat_names = ("n",)
+
     def __init__(self, kind):
         self.kind = kind
 
@@ -215,7 +302,7 @@ class _Broken(BaseActorAuxiliaryObjective):
         ("detached", ValueError, "detached loss"),
         ("vector", ValueError, "scalar tensor"),
         ("nan", ValueError, "not finite"),
-        ("normalizer", KeyError, "was not returned by prepare_batch"),
+        ("normalizer", KeyError, "not one of its declared stat_names"),
         ("collision", KeyError, "metric collision"),
     ],
 )
@@ -228,115 +315,87 @@ def test_invalid_results_fail_with_objective_name(kind, exc, match):
     assert "bad" in str(info.value)
 
 
-class _Processor(BaseActorAuxiliaryObjective):
-    uses_logits_processor = True
-
-    def __init__(self, width=3, wrong_leading=False):
-        self.width, self.wrong_leading = width, wrong_leading
-
-    def prepare_batch(self, data):
-        return {"n": 1.0}
-
-    def process_logits(self, *, logits, data, context):
-        rows = logits.shape[0] + (1 if self.wrong_leading else 0)
-        return {"cols": logits.new_zeros(rows, self.width)}
-
-    def compute(self, *, model_output, data, context):
-        return ActorObjectiveResult(loss_sum=model_output["aux/p/cols"].sum() * 0.0, normalizer="n")
-
-
-def test_process_logits_namespaces_outputs_and_validates_shape():
-    data = _data()
-    logits = torch.zeros(7, 32)
-    composer = _composer(_spec("p", _Processor()))
-    composer.prepare_global_stats(data)
-    out = composer.process_logits(logits=logits, data=data)
-    assert list(out) == ["aux/p/cols"]
-    assert out["aux/p/cols"].shape == (7, 3)
-
-    composer = _composer(_spec("p", _Processor(wrong_leading=True)))
-    composer.prepare_global_stats(data)
-    with pytest.raises(ValueError, match="leading dim"):
-        composer.process_logits(logits=logits, data=data)
-
-    composer = _composer(_spec("p", _Processor(width=32)))
-    composer.prepare_global_stats(data)
-    with pytest.raises(ValueError, match="not compact"):
-        composer.process_logits(logits=logits, data=data)
-
-
-def test_loader_builds_objectives_from_file_and_rejects_bad_ones(tmp_path):
-    src = textwrap.dedent(
-        """
-        from verl.workers.utils.auxiliary_objectives import ActorObjectiveResult, BaseActorAuxiliaryObjective
-
-        class Obj(BaseActorAuxiliaryObjective):
-            def __init__(self, scale):
-                self.scale = scale
-            def prepare_batch(self, data):
-                return {"n": 1.0}
-            def compute(self, *, model_output, data, context):
-                return ActorObjectiveResult(loss_sum=model_output["log_probs"].sum() * self.scale, normalizer="n")
-
-        def build_objective(scale=1.0):
-            return Obj(scale)
-
-        def build_broken():
-            return object()
-        """
-    )
-    path = tmp_path / "objectives.py"
-    path.write_text(src)
-
+def test_loader_builds_objectives_and_skips_zero_weight(tmp_path):
+    path = _objective_file(tmp_path, SQUARE_SRC)
     cfgs = [
-        AuxiliaryObjectiveConfig(name="a", path=str(path), weight=0.5, kwargs={"scale": 2.0}),
-        AuxiliaryObjectiveConfig(name="b", path=str(path)),
+        AuxiliaryObjectiveConfig(name="a", path=path, weight=0.5, kwargs={"scale": 2.0}),
+        AuxiliaryObjectiveConfig(name="b", path=path),
+        AuxiliaryObjectiveConfig(name="zero", path=path, weight=0.0),
+        AuxiliaryObjectiveConfig(name="probe", path=path, weight=0.0, metrics_only=True),
     ]
     loaded = load_auxiliary_objectives(cfgs)
-    assert [o.name for o in loaded] == ["a", "b"]
+    assert [o.name for o in loaded] == ["a", "b", "probe"]
     assert loaded[0].objective.scale == 2.0 and loaded[0].weight == 0.5
+    assert loaded[2].metrics_only
 
     with pytest.raises(ValueError, match="unique"):
-        load_auxiliary_objectives([cfgs[0], AuxiliaryObjectiveConfig(name="a", path=str(path))])
+        load_auxiliary_objectives([cfgs[0], AuxiliaryObjectiveConfig(name="a", path=path)])
     with pytest.raises(TypeError, match="missing attribute"):
-        load_auxiliary_objectives([AuxiliaryObjectiveConfig(name="c", path=str(path), factory="build_broken")])
-
-    composer = AuxiliaryLossComposer(_base_loss, loaded, "token-mean")
-    assert composer.config_digest() == AuxiliaryLossComposer(_base_loss, loaded, "token-mean").config_digest()
+        load_auxiliary_objectives([AuxiliaryObjectiveConfig(name="c", path=path, factory="build_broken")])
 
 
-def test_maybe_wrap_rejects_unsupported_backend_and_fused_processor(tmp_path):
-    src = textwrap.dedent(
-        """
-        from verl.workers.utils.auxiliary_objectives import ActorObjectiveResult, BaseActorAuxiliaryObjective
-
-        class P(BaseActorAuxiliaryObjective):
-            uses_logits_processor = True
-            def process_logits(self, *, logits, data, context):
-                return {}
-            def compute(self, *, model_output, data, context):
-                raise NotImplementedError
-
-        def build_objective():
-            return P()
-        """
+def test_digest_covers_kwargs_file_and_selected_ids(tmp_path):
+    path = _objective_file(tmp_path, SQUARE_SRC)
+    base = [AuxiliaryObjectiveConfig(name="a", path=path, kwargs={"scale": 1.0})]
+    changed_kwargs = [AuxiliaryObjectiveConfig(name="a", path=path, kwargs={"scale": 2.0})]
+    d0 = AuxiliaryLossComposer(_base_loss, load_auxiliary_objectives(base), "m").config_digest()
+    assert d0 == AuxiliaryLossComposer(_base_loss, load_auxiliary_objectives(base), "m").config_digest()
+    assert d0 != AuxiliaryLossComposer(_base_loss, load_auxiliary_objectives(changed_kwargs), "m").config_digest()
+    assert d0 != AuxiliaryLossComposer(_base_loss, load_auxiliary_objectives(base), "m", (1, 2)).config_digest()
+    other_file = _objective_file(tmp_path, SQUARE_SRC + "\n    # different bytes\n", name="objectives2.py")
+    assert (
+        d0
+        != AuxiliaryLossComposer(
+            _base_loss, load_auxiliary_objectives([AuxiliaryObjectiveConfig(name="a", path=other_file)]), "m"
+        ).config_digest()
     )
-    path = tmp_path / "p.py"
-    path.write_text(src)
-    entry = AuxiliaryObjectiveConfig(name="p", path=str(path))
 
-    megatron = SimpleNamespace(strategy="megatron", auxiliary_objectives=[entry], loss_agg_mode="token-mean")
+
+def test_maybe_wrap_requires_process_group(tmp_path, monkeypatch):
+    path = _objective_file(tmp_path, SQUARE_SRC)
+    cfg = SimpleNamespace(
+        strategy="fsdp",
+        auxiliary_objectives=[AuxiliaryObjectiveConfig(name="a", path=path)],
+        loss_agg_mode="token-mean",
+        selected_token_logprobs=SimpleNamespace(token_ids=[]),
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    with pytest.raises(RuntimeError, match="process group"):
+        maybe_wrap_with_auxiliary_objectives(_base_loss, cfg)
+
+
+def test_maybe_wrap_validates_backend_requirements_and_ranks(tmp_path, fake_dist, monkeypatch):
+    path = _objective_file(tmp_path, SQUARE_SRC)
+    entry = AuxiliaryObjectiveConfig(name="a", path=path)
+
+    def cfg(**over):
+        base = dict(
+            strategy="fsdp",
+            auxiliary_objectives=[entry],
+            loss_agg_mode="token-mean",
+            selected_token_logprobs=SimpleNamespace(token_ids=[3, 4]),
+        )
+        base.update(over)
+        return SimpleNamespace(**base)
+
     with pytest.raises(NotImplementedError, match="only supported with strategy"):
-        maybe_wrap_with_auxiliary_objectives(_base_loss, megatron)
+        maybe_wrap_with_auxiliary_objectives(_base_loss, cfg(strategy="megatron"))
 
-    fused = SimpleNamespace(
-        strategy="fsdp", auxiliary_objectives=[entry], loss_agg_mode="token-mean", use_fused_kernels=True, engine=None
-    )
-    with pytest.raises(NotImplementedError, match="use_fused_kernels"):
-        maybe_wrap_with_auxiliary_objectives(_base_loss, fused)
+    needs_entropy = AuxiliaryObjectiveConfig(name="e", path=path, factory="build_needs_entropy")
+    with pytest.raises(ValueError, match="calculate_entropy"):
+        maybe_wrap_with_auxiliary_objectives(
+            _base_loss, cfg(auxiliary_objectives=[needs_entropy]), available_model_outputs={"log_probs"}
+        )
 
-    ok = SimpleNamespace(
-        strategy="fsdp2", auxiliary_objectives=[entry], loss_agg_mode="token-mean", use_fused_kernels=False, engine=None
-    )
-    composer = maybe_wrap_with_auxiliary_objectives(_base_loss, ok)
-    assert isinstance(composer, AuxiliaryLossComposer) and composer.has_logits_processors
+    composer = maybe_wrap_with_auxiliary_objectives(_base_loss, cfg(), available_model_outputs={"log_probs"})
+    assert isinstance(composer, AuxiliaryLossComposer)
+    assert composer.selected_token_ids == (3, 4)
+
+    def disagreeing_gather(out, obj, *a, **k):
+        out[0] = obj
+        out[1] = "someone-else"
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", disagreeing_gather)
+    with pytest.raises(RuntimeError, match="differently across ranks"):
+        maybe_wrap_with_auxiliary_objectives(_base_loss, cfg())

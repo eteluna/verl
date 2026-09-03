@@ -18,39 +18,47 @@ PPO/GRPO actor loss::
 
     L_total = L_base + sum_i weight_i * L_i
 
-Each objective declares the batch fields and model outputs it reads, may optionally reduce
-the transient logits of the same actor forward into compact, namespaced outputs, and returns an
-unweighted loss *sum* plus the name of the statistic that normalizes it. verl owns loading,
-execution order, global (mini-batch) normalization, coefficient application, metric
-namespacing and validation. An empty objective list leaves the actor loss untouched.
+Each objective declares the batch fields and model outputs it reads, the statistics it normalizes
+by, and returns an unweighted loss *sum* per micro-batch. verl owns loading, execution order, global
+(mini-batch) normalization, coefficient application, metric namespacing and validation. An empty
+objective list leaves the actor loss untouched.
+
+Objectives only ever read ``model_output``. Anything that has to be derived from the full logits is
+produced by the engine from configuration, not by plugin callbacks: ``actor.selected_token_logprobs``
+makes every actor-update forward emit ``model_output["selected_token_logprobs"]``, the
+full-vocabulary log-softmax at a fixed list of token ids, laid out like ``log_probs``.
 
 Lifecycle for one actor mini-batch::
 
-    prepare_global_stats(data)                    # once, on the unsplit mini-batch, SUM over DP
+    prepare_global_stats(data)          # once, on the unsplit mini-batch, one SUM over DP
         -> for each micro-batch:
-             forward -> process_logits(logits)    # optional, same forward, logits still transient
-                     -> base loss (pg, entropy, KL)
-                     -> compute(model_output, data) for every objective, in config order
+             forward                    # engine emits log_probs [, entropy, selected_token_logprobs]
+             -> base loss (pg, entropy, KL)
+             -> compute(model_output, data) for every objective, in config order
              backward on the combined scalar
 
 Normalization: for objective ``i`` and micro-batch ``m`` the contribution is
 ``dp_size * loss_sum_i^(m) / N_i`` where ``N_i`` is the SUM-reduced statistic named by
 ``ActorObjectiveResult.normalizer``. Summed over micro-batches and averaged over data-parallel ranks
 by the gradient reduction this yields the global mini-batch mean, invariant to how the mini-batch was
-split, mirroring ``batch_num_tokens`` in :func:`verl.workers.utils.losses.ppo_loss`.
+split, mirroring ``batch_num_tokens`` in :func:`verl.workers.utils.losses.ppo_loss`. This requires the
+objective to be additively decomposable over samples; cross-sample terms are out of scope.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 import torch.distributed
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
@@ -59,9 +67,10 @@ from verl.utils.import_utils import load_extern_object
 from verl.utils.metric import AggregationType, Metric
 
 __all__ = [
+    "AUX_API_VERSION",
     "AUX_METRIC_PREFIX",
-    "AUX_OUTPUT_PREFIX",
     "AUX_GLOBAL_STATS_KEY",
+    "SELECTED_TOKEN_LOGPROBS_KEY",
     "ActorObjectiveContext",
     "ActorObjectiveResult",
     "ActorAuxiliaryObjective",
@@ -70,14 +79,19 @@ __all__ = [
     "AuxiliaryLossComposer",
     "load_auxiliary_objectives",
     "maybe_wrap_with_auxiliary_objectives",
-    "SpecifiedTokenCalibrationObjective",
+    "SelectedTokenCalibrationObjective",
 ]
 
-# Metrics land under ``actor/aux/<name>/...``; processor outputs under ``aux/<name>/<key>`` in model_output.
+logger = logging.getLogger(__file__)
+
+# Bumped when the objective protocol or the composer's normalization contract changes.
+AUX_API_VERSION = 1
+# Metrics land under ``actor/aux/<name>/...``.
 AUX_METRIC_PREFIX = "actor/aux"
-AUX_OUTPUT_PREFIX = "aux"
 # Non-tensor key on the mini-batch TensorDict carrying ``{objective_name: {stat_name: float}}``.
 AUX_GLOBAL_STATS_KEY = "aux_global_stats"
+# model_output key of the engine-owned selected-token projection.
+SELECTED_TOKEN_LOGPROBS_KEY = "selected_token_logprobs"
 
 _SUPPORTED_STRATEGIES = ("fsdp", "fsdp2")
 
@@ -87,7 +101,7 @@ class ActorObjectiveContext:
     """Read-only, framework-owned context handed to every objective callback.
 
     Args:
-        name: The objective's configured name; its processor outputs live at ``aux/<name>/<key>``.
+        name: The objective's configured name.
         global_stats: This objective's ``prepare_batch`` statistics after the SUM reduction over the
             data-parallel group, i.e. totals over the whole actor mini-batch.
         dp_size: Data-parallel world size of the actor.
@@ -95,6 +109,8 @@ class ActorObjectiveContext:
             ``global_stats[result.normalizer]``).
         batch_num_tokens: Number of loss-mask tokens in the global mini-batch, or None.
         global_batch_size: Number of sequences in the global mini-batch, or None.
+        selected_token_ids: ``actor.selected_token_logprobs.token_ids`` in column order of
+            ``model_output["selected_token_logprobs"]``; empty when the projection is off.
     """
 
     name: str
@@ -103,6 +119,7 @@ class ActorObjectiveContext:
     loss_agg_mode: str
     batch_num_tokens: Optional[int] = None
     global_batch_size: Optional[int] = None
+    selected_token_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -114,8 +131,8 @@ class ActorObjectiveResult:
             scalar tensor connected to the actor's autograd graph. When the objective has no
             applicable element in this micro-batch, return a differentiable zero (for example
             ``some_output.sum() * 0.0``).
-        normalizer: Name of the ``prepare_batch`` statistic that counts the applicable elements over
-            the whole mini-batch. The composer divides by its SUM-reduced value.
+        normalizer: Name of the declared statistic that counts the applicable elements over the whole
+            mini-batch. The composer divides by its SUM-reduced value.
         metrics: Optional plugin metrics. Plain numbers become MEAN metrics; pass a
             :class:`verl.utils.metric.Metric` to choose another aggregation. Keys are namespaced
             under ``actor/aux/<name>/`` by the composer.
@@ -130,22 +147,21 @@ class ActorObjectiveResult:
 class ActorAuxiliaryObjective(Protocol):
     """The objective protocol. Subclass :class:`BaseActorAuxiliaryObjective` for sane defaults.
 
+    Attributes are static declarations verl validates at start-up: ``required_batch_keys`` must be
+    present on the actor mini-batch, ``required_model_output_keys`` must be produced by the configured
+    forward, and ``stat_names`` is the exact, ordered set of keys ``prepare_batch`` returns on every
+    rank (the reduction packs them in that order, so the schema must not depend on data).
+
     All callbacks must treat their inputs as read-only and must not run distributed collectives,
     call ``backward`` or touch the optimizer; the composer owns those.
     """
 
     required_batch_keys: tuple[str, ...]
     required_model_output_keys: tuple[str, ...]
-    uses_logits_processor: bool
+    stat_names: tuple[str, ...]
 
     def prepare_batch(self, data: TensorDict) -> Mapping[str, float]:
-        """Return local additive statistics (counts, sums) of the *unsplit* mini-batch, no gradients."""
-        ...
-
-    def process_logits(
-        self, *, logits: torch.Tensor, data: TensorDict, context: ActorObjectiveContext
-    ) -> Mapping[str, torch.Tensor]:
-        """Reduce transient ``(total_nnz, vocab)`` logits into compact ``(total_nnz, ...)`` tensors."""
+        """Return local additive statistics of the *unsplit* mini-batch, one per ``stat_names`` entry."""
         ...
 
     def compute(
@@ -160,17 +176,11 @@ class BaseActorAuxiliaryObjective:
 
     required_batch_keys: tuple[str, ...] = ()
     required_model_output_keys: tuple[str, ...] = ()
-    uses_logits_processor: bool = False
+    stat_names: tuple[str, ...] = ()
 
     def prepare_batch(self, data: TensorDict) -> Mapping[str, float]:
-        """Default: no statistics. Objectives that normalize must override."""
+        """Default: no statistics. Objectives that normalize must declare ``stat_names`` and override."""
         return {}
-
-    def process_logits(
-        self, *, logits: torch.Tensor, data: TensorDict, context: ActorObjectiveContext
-    ) -> Mapping[str, torch.Tensor]:
-        """Default: not a logits processor."""
-        raise NotImplementedError(f"{type(self).__name__} does not declare uses_logits_processor")
 
     def compute(
         self, *, model_output: Mapping[str, torch.Tensor], data: TensorDict, context: ActorObjectiveContext
@@ -181,35 +191,44 @@ class BaseActorAuxiliaryObjective:
 
 @dataclass(frozen=True)
 class LoadedAuxiliaryObjective:
-    """A configured objective instance together with its name and coefficient."""
+    """A configured objective instance together with its name, coefficient and mode."""
 
     name: str
     weight: float
     objective: Any
+    metrics_only: bool = False
     digest_payload: Mapping[str, Any] = field(default_factory=dict)
 
 
 def _validate_objective_instance(name: str, obj: Any) -> None:
-    for attr in ("required_batch_keys", "required_model_output_keys", "uses_logits_processor"):
+    for attr in ("required_batch_keys", "required_model_output_keys", "stat_names"):
         if not hasattr(obj, attr):
             raise TypeError(f"auxiliary objective '{name}' is missing attribute '{attr}'")
-    for method in ("prepare_batch", "compute"):
-        if not callable(getattr(obj, method, None)):
-            raise TypeError(f"auxiliary objective '{name}' is missing method '{method}'")
-    if obj.uses_logits_processor and not callable(getattr(obj, "process_logits", None)):
-        raise TypeError(f"auxiliary objective '{name}' declares uses_logits_processor but has no process_logits")
-    for attr in ("required_batch_keys", "required_model_output_keys"):
         keys = getattr(obj, attr)
         if not isinstance(keys, tuple | list) or not all(isinstance(k, str) for k in keys):
             raise TypeError(f"auxiliary objective '{name}'.{attr} must be a tuple of str, got {keys!r}")
+    if len(set(obj.stat_names)) != len(obj.stat_names):
+        raise ValueError(f"auxiliary objective '{name}'.stat_names has duplicates: {obj.stat_names}")
+    for method in ("prepare_batch", "compute"):
+        if not callable(getattr(obj, method, None)):
+            raise TypeError(f"auxiliary objective '{name}' is missing method '{method}'")
+
+
+def _file_sha256(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return "unreadable"
 
 
 def load_auxiliary_objectives(configs) -> list[LoadedAuxiliaryObjective]:
     """Instantiate objectives from ``actor.auxiliary_objectives`` config entries.
 
-    Each entry names a python file (``path``), a factory in it (``factory``), a ``weight`` and
-    ``kwargs`` forwarded to the factory. Names must be unique and weights finite; both are also
-    checked by the config dataclass, so this is the second line of defense for hand-built configs.
+    Each entry names a python file (``path``), a factory in it (``factory``), a ``weight``, ``kwargs``
+    forwarded to the factory and ``metrics_only``. An entry with ``weight == 0`` and
+    ``metrics_only=False`` is skipped entirely: a zero coefficient would still retain the graph and
+    run the reduction. Names must be unique and weights finite.
     """
     loaded: list[LoadedAuxiliaryObjective] = []
     seen: set[str] = set()
@@ -221,6 +240,14 @@ def load_auxiliary_objectives(configs) -> list[LoadedAuxiliaryObjective]:
         weight = float(cfg.weight)
         if isinstance(cfg.weight, bool) or not math.isfinite(weight):
             raise ValueError(f"auxiliary objective '{name}' weight must be a finite number, got {cfg.weight!r}")
+        metrics_only = bool(getattr(cfg, "metrics_only", False))
+        if weight == 0.0 and not metrics_only:
+            logger.warning(
+                "auxiliary objective '%s' has weight 0 and metrics_only=false; skipping it entirely "
+                "(set metrics_only=true to keep its metrics)",
+                name,
+            )
+            continue
         factory = load_extern_object(cfg.path, cfg.factory)
         if not callable(factory):
             raise TypeError(f"auxiliary objective '{name}': {cfg.factory} in {cfg.path} is not callable")
@@ -232,7 +259,20 @@ def load_auxiliary_objectives(configs) -> list[LoadedAuxiliaryObjective]:
                 name=name,
                 weight=weight,
                 objective=obj,
-                digest_payload={"name": name, "weight": weight, "path": cfg.path, "factory": cfg.factory},
+                metrics_only=metrics_only,
+                digest_payload={
+                    "api_version": AUX_API_VERSION,
+                    "name": name,
+                    "weight": weight,
+                    "metrics_only": metrics_only,
+                    "path": os.path.abspath(cfg.path),
+                    "file_sha256": _file_sha256(cfg.path),
+                    "factory": cfg.factory,
+                    "kwargs": kwargs,
+                    "stat_names": list(obj.stat_names),
+                    "required_batch_keys": list(obj.required_batch_keys),
+                    "required_model_output_keys": list(obj.required_model_output_keys),
+                },
             )
         )
     return loaded
@@ -241,18 +281,28 @@ def load_auxiliary_objectives(configs) -> list[LoadedAuxiliaryObjective]:
 class AuxiliaryLossComposer:
     """Wraps the selected actor loss and composes configured objectives with it.
 
-    The engine treats it as the loss callable and additionally calls two optional stages when
-    present: :meth:`prepare_global_stats` once per mini-batch before micro-batch splitting, and
-    :meth:`process_logits` per micro-batch while the logits are still alive.
+    The engine treats it as the loss callable and additionally calls :meth:`prepare_global_stats`
+    once per mini-batch before micro-batch splitting.
     """
 
-    def __init__(self, base_loss_fn: Callable, objectives: list[LoadedAuxiliaryObjective], loss_agg_mode: str):
+    def __init__(
+        self,
+        base_loss_fn: Callable,
+        objectives: list[LoadedAuxiliaryObjective],
+        loss_agg_mode: str,
+        selected_token_ids: tuple[int, ...] = (),
+    ):
         self.base_loss_fn = base_loss_fn
         self.objectives = list(objectives)
         self.loss_agg_mode = loss_agg_mode
+        self.selected_token_ids = tuple(int(t) for t in selected_token_ids)
         names = [o.name for o in self.objectives]
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate auxiliary objective names: {names}")
+        # Static packing schema for the one SUM reduction: identical on every rank by construction.
+        self._stat_slots: list[tuple[str, str]] = [
+            (spec.name, stat) for spec in self.objectives for stat in spec.objective.stat_names
+        ]
 
     # ---- introspection ----------------------------------------------------------------------------------
     @property
@@ -260,20 +310,37 @@ class AuxiliaryLossComposer:
         """Objective names in execution order."""
         return tuple(o.name for o in self.objectives)
 
-    @property
-    def has_logits_processors(self) -> bool:
-        """Whether any objective declared ``uses_logits_processor``."""
-        return any(o.objective.uses_logits_processor for o in self.objectives)
-
     def config_digest(self) -> str:
-        """Stable digest of the ordered objective configuration, compared across ranks at init."""
-        payload = [o.digest_payload for o in self.objectives]
+        """Stable digest of the resolved objective configuration, compared across ranks at start-up."""
+        payload = {
+            "selected_token_ids": list(self.selected_token_ids),
+            "objectives": [o.digest_payload for o in self.objectives],
+        }
         return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+    def validate_requirements(self, available_model_outputs: set[str]) -> None:
+        """Fail at start-up when an objective needs a model output the configured forward will not emit."""
+        hints = {
+            "entropy": "set actor.calculate_entropy=true",
+            "sum_pi_squared": "set actor.calculate_sum_pi_squared=true",
+            SELECTED_TOKEN_LOGPROBS_KEY: "set actor.selected_token_logprobs.token_ids",
+            "log_probs": "the configured forward skips log_probs (distillation-only mode)",
+        }
+        for spec in self.objectives:
+            missing = [k for k in spec.objective.required_model_output_keys if k not in available_model_outputs]
+            if missing:
+                advice = "; ".join(hints.get(k, f"'{k}' is not a known model output") for k in missing)
+                raise ValueError(
+                    f"auxiliary objective '{spec.name}' requires model outputs {missing} which the configured "
+                    f"actor forward does not produce ({advice}); available: {sorted(available_model_outputs)}"
+                )
 
     # ---- stage 1: global normalization statistics -------------------------------------------------------
     def prepare_global_stats(self, data: TensorDict, dp_group=None) -> None:
-        """Collect every objective's local statistics on the unsplit mini-batch and SUM-reduce them once.
+        """Collect every objective's declared statistics on the unsplit mini-batch and SUM-reduce them once.
 
+        Values are packed in the static ``(objective, stat_name)`` order every rank derives from the
+        configuration, so ranks never disagree on the tensor shape or on which slot holds which count.
         The result is stored as the non-tensor ``aux_global_stats`` entry so it survives micro-batch
         splitting, exactly like ``batch_num_tokens``. Objectives never issue collectives themselves.
         """
@@ -283,63 +350,40 @@ class AuxiliaryLossComposer:
             missing = [k for k in spec.objective.required_batch_keys if k not in data.keys()]
             if missing:
                 raise KeyError(f"auxiliary objective '{spec.name}' requires batch keys {missing} which are absent")
-        local: list[tuple[str, str, float]] = []
+        by_name = {spec.name: spec for spec in self.objectives}
+        collected: dict[str, Mapping[str, Any]] = {}
         for spec in self.objectives:
-            stats = spec.objective.prepare_batch(data) or {}
-            for stat_name, value in stats.items():
-                if isinstance(value, torch.Tensor):
-                    if value.requires_grad or value.numel() != 1:
-                        raise ValueError(
-                            f"auxiliary objective '{spec.name}' stat '{stat_name}' must be a detached scalar"
-                        )
-                    value = value.item()
-                value = float(value)
-                if not math.isfinite(value):
-                    raise ValueError(f"auxiliary objective '{spec.name}' stat '{stat_name}' is not finite: {value}")
-                local.append((spec.name, stat_name, value))
-        packed = torch.tensor([v for _, _, v in local], dtype=torch.float64)
-        if torch.distributed.is_initialized() and packed.numel() > 0:
+            stats = dict(spec.objective.prepare_batch(data) or {})
+            declared = set(spec.objective.stat_names)
+            if set(stats) != declared:
+                raise ValueError(
+                    f"auxiliary objective '{spec.name}'.prepare_batch returned keys {sorted(stats)} but declared "
+                    f"stat_names {sorted(declared)}; the schema must be static"
+                )
+            collected[spec.name] = stats
+        values = []
+        for name, stat in self._stat_slots:
+            value = collected[name][stat]
+            if isinstance(value, torch.Tensor):
+                if value.requires_grad or value.numel() != 1:
+                    raise ValueError(f"auxiliary objective '{name}' stat '{stat}' must be a detached scalar")
+                value = value.item()
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError(f"auxiliary objective '{name}' stat '{stat}' is not finite: {value}")
+            values.append(value)
+        packed = torch.tensor(values, dtype=torch.float64)
+        if self._stat_slots and torch.distributed.is_initialized():
             packed = packed.to(get_device_id())
             torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM, group=dp_group)
             packed = packed.cpu()
         reduced: dict[str, dict[str, float]] = {spec.name: {} for spec in self.objectives}
-        for (name, stat_name, _), value in zip(local, packed.tolist(), strict=True):
-            reduced[name][stat_name] = float(value)
+        for (name, stat), value in zip(self._stat_slots, packed.tolist(), strict=True):
+            reduced[name][stat] = float(value)
+        del by_name
         tu.assign_non_tensor(data, **{AUX_GLOBAL_STATS_KEY: reduced})
 
-    # ---- stage 2: optional same-forward logits processing ----------------------------------------------
-    def process_logits(self, *, logits: torch.Tensor, data: TensorDict) -> dict[str, torch.Tensor]:
-        """Run every declared processor on the transient logits and namespace the compact outputs.
-
-        ``logits`` are exactly the logits ``log_probs`` is computed from (already divided by the
-        rollout temperature), laid out as ``(total_nnz, vocab)``. Each returned tensor must have
-        ``total_nnz`` as its leading dimension; the engine re-nests them per sequence.
-        """
-        outputs: dict[str, torch.Tensor] = {}
-        if not self.has_logits_processors:
-            return outputs
-        contexts = self._contexts(data)
-        for spec in self.objectives:
-            if not spec.objective.uses_logits_processor:
-                continue
-            produced = spec.objective.process_logits(logits=logits, data=data, context=contexts[spec.name])
-            for key, value in (produced or {}).items():
-                if not isinstance(value, torch.Tensor):
-                    raise TypeError(f"auxiliary objective '{spec.name}' processor output '{key}' is not a tensor")
-                if value.dim() == 0 or value.shape[0] != logits.shape[0]:
-                    raise ValueError(
-                        f"auxiliary objective '{spec.name}' processor output '{key}' must have leading dim "
-                        f"{logits.shape[0]} (total_nnz), got {tuple(value.shape)}"
-                    )
-                if value.shape[1:].numel() > logits.shape[-1] // 4:
-                    raise ValueError(
-                        f"auxiliary objective '{spec.name}' processor output '{key}' is not compact: "
-                        f"{tuple(value.shape[1:])} per token exceeds vocab/4"
-                    )
-                outputs[f"{AUX_OUTPUT_PREFIX}/{spec.name}/{key}"] = value
-        return outputs
-
-    # ---- stage 3: the loss ------------------------------------------------------------------------------
+    # ---- stage 2: the loss ------------------------------------------------------------------------------
     def __call__(self, model_output=None, data: TensorDict = None, dp_group=None, **kwargs):
         """Compose the base loss with every configured objective.
 
@@ -359,10 +403,16 @@ class AuxiliaryLossComposer:
             if missing:
                 raise KeyError(f"auxiliary objective '{spec.name}' requires model outputs {missing} which are absent")
             context = contexts[spec.name]
-            result = spec.objective.compute(model_output=model_output, data=data, context=context)
-            contribution, active, normalizer_value = self._normalize(spec, result, context)
-            weighted = spec.weight * contribution
-            total = total + weighted
+            if spec.metrics_only:
+                with torch.no_grad():
+                    result = spec.objective.compute(model_output=model_output, data=data, context=context)
+                contribution, active, normalizer_value = self._normalize(spec, result, context, require_grad=False)
+                weighted = torch.zeros_like(contribution)
+            else:
+                result = spec.objective.compute(model_output=model_output, data=data, context=context)
+                contribution, active, normalizer_value = self._normalize(spec, result, context, require_grad=True)
+                weighted = spec.weight * contribution
+                total = total + weighted
             prefix = f"{AUX_METRIC_PREFIX}/{spec.name}"
             self._put_metric(metrics, f"{prefix}/loss", Metric(AggregationType.SUM, contribution.detach()))
             self._put_metric(metrics, f"{prefix}/weighted_loss", Metric(AggregationType.SUM, weighted.detach()))
@@ -392,12 +442,15 @@ class AuxiliaryLossComposer:
                 loss_agg_mode=self.loss_agg_mode,
                 batch_num_tokens=batch_num_tokens,
                 global_batch_size=global_batch_size,
+                selected_token_ids=self.selected_token_ids,
             )
             for spec in self.objectives
         }
 
     @staticmethod
-    def _normalize(spec: LoadedAuxiliaryObjective, result: ActorObjectiveResult, context: ActorObjectiveContext):
+    def _normalize(
+        spec: LoadedAuxiliaryObjective, result: ActorObjectiveResult, context: ActorObjectiveContext, require_grad: bool
+    ):
         name = spec.name
         if not isinstance(result, ActorObjectiveResult):
             raise TypeError(
@@ -408,17 +461,17 @@ class AuxiliaryLossComposer:
             raise ValueError(f"auxiliary objective '{name}' loss_sum must be a scalar tensor")
         if not torch.isfinite(loss_sum).all():
             raise ValueError(f"auxiliary objective '{name}' loss_sum is not finite: {loss_sum.item()}")
-        if result.normalizer not in context.global_stats:
+        if result.normalizer not in spec.objective.stat_names:
             raise KeyError(
-                f"auxiliary objective '{name}' normalizer '{result.normalizer}' was not returned by prepare_batch; "
-                f"available: {sorted(context.global_stats)}"
+                f"auxiliary objective '{name}' normalizer '{result.normalizer}' is not one of its declared "
+                f"stat_names {list(spec.objective.stat_names)}"
             )
         normalizer = float(context.global_stats[result.normalizer])
         if normalizer < 0:
             raise ValueError(f"auxiliary objective '{name}' normalizer '{result.normalizer}' is negative")
         loss_sum = loss_sum.reshape(())
         if normalizer > 0:
-            if not loss_sum.requires_grad:
+            if require_grad and not loss_sum.requires_grad:
                 raise ValueError(
                     f"auxiliary objective '{name}' returned a detached loss while active; the objective would "
                     "silently contribute no gradient"
@@ -437,11 +490,15 @@ class AuxiliaryLossComposer:
         metrics[key] = value
 
 
-def maybe_wrap_with_auxiliary_objectives(base_loss_fn: Callable, actor_config) -> Callable:
+def maybe_wrap_with_auxiliary_objectives(
+    base_loss_fn: Callable, actor_config, available_model_outputs: Optional[set[str]] = None
+) -> Callable:
     """Return ``base_loss_fn`` unchanged when no objectives are configured, else the composer.
 
-    Fails fast at initialization on an unsupported training backend or when a declared logits
-    processor cannot be honoured because fused kernels never materialize the logits.
+    Must be called after the actor's process group exists (the cross-rank configuration handshake is
+    mandatory, not best-effort). Fails at initialization on an unsupported training backend, on a
+    configuration that differs across ranks, or on an objective whose required model outputs the
+    configured forward will not produce.
     """
     configs = list(getattr(actor_config, "auxiliary_objectives", None) or [])
     if not configs:
@@ -451,57 +508,100 @@ def maybe_wrap_with_auxiliary_objectives(base_loss_fn: Callable, actor_config) -
         raise NotImplementedError(
             f"actor.auxiliary_objectives is only supported with strategy in {_SUPPORTED_STRATEGIES}, got {strategy!r}"
         )
+    if not torch.distributed.is_initialized():
+        raise RuntimeError(
+            "actor.auxiliary_objectives must be initialized after the actor process group exists so the "
+            "configuration can be checked across ranks"
+        )
+    selected = getattr(actor_config, "selected_token_logprobs", None)
+    selected_ids = tuple(int(t) for t in (getattr(selected, "token_ids", None) or []))
     objectives = load_auxiliary_objectives(configs)
     composer = AuxiliaryLossComposer(
-        base_loss_fn=base_loss_fn, objectives=objectives, loss_agg_mode=getattr(actor_config, "loss_agg_mode", "")
+        base_loss_fn=base_loss_fn,
+        objectives=objectives,
+        loss_agg_mode=getattr(actor_config, "loss_agg_mode", ""),
+        selected_token_ids=selected_ids,
     )
-    if composer.has_logits_processors:
-        engine = getattr(actor_config, "engine", None)
-        use_fused = bool(getattr(actor_config, "use_fused_kernels", False)) or bool(
-            getattr(engine, "use_fused_kernels", False)
+    if available_model_outputs is not None:
+        composer.validate_requirements(set(available_model_outputs))
+    digests = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(digests, composer.config_digest())
+    if len(set(digests)) != 1:
+        raise RuntimeError(
+            "actor.auxiliary_objectives resolves differently across ranks; the configuration must be identical"
         )
-        if use_fused:
-            names = [o.name for o in objectives if o.objective.uses_logits_processor]
-            raise NotImplementedError(
-                f"auxiliary objectives {names} declare a logits processor, which needs the full logits; "
-                "use_fused_kernels=True never materializes them. Disable fused kernels or the processor."
-            )
-    if torch.distributed.is_initialized():
-        digests = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(digests, composer.config_digest())
-        if len(set(digests)) != 1:
-            raise RuntimeError("actor.auxiliary_objectives differs across ranks; the configuration must be identical")
     return composer
 
 
-class SpecifiedTokenCalibrationObjective(BaseActorAuxiliaryObjective):
-    """Reference objective: binary cross-entropy calibration of the mass on a set of token IDs.
+class SelectedTokenCalibrationObjective(BaseActorAuxiliaryObjective):
+    """Reference objective: binary cross-entropy calibration of the mass on a set of token ids.
 
-    At every response position where ``data[target_key] >= 0`` the objective reads the current-policy
-    probability mass assigned to ``positive_token_ids`` (out of ``token_ids``) and pulls it toward
-    the binary target. Positions with a negative target are ignored. The reduction happens in
-    ``process_logits`` so only ``len(token_ids)`` values per token leave the forward; the full logits
-    are never retained.
+    Reads the engine-owned ``model_output["selected_token_logprobs"]`` (configure
+    ``actor.selected_token_logprobs.token_ids`` to include every id used here). At every response
+    position where ``data[target_key]`` is 0 or 1 it forms the logit of the positive set against the
+    negative set and applies ``binary_cross_entropy_with_logits``; positions marked -1 are ignored.
+
+    ``normalize_over`` selects what the positive mass is measured against:
+
+    - ``"token_set"`` (default): the negatives are ``negative_token_ids`` (default: every selected id not
+      in the positive set), so the probability is conditional on the label alphabet. This is what a
+      yes/no reranker reads: ``log_softmax(logits[[no, yes]])[yes]``.
+    - ``"vocab"``: the negatives are the whole rest of the vocabulary, so the probability is the raw
+      full-vocabulary mass of the positive tokens.
 
     Batch contract: ``data[target_key]`` is a ``(bsz, response_len)`` tensor (padded or nested) with
     values in ``{-1, 0, 1}``. How it gets there (dataset field, reward-side transform) is up to the
     caller.
     """
 
-    uses_logits_processor = True
-    required_model_output_keys = ()
+    required_model_output_keys = (SELECTED_TOKEN_LOGPROBS_KEY,)
+    stat_names = ("cells",)
 
-    def __init__(self, token_ids, positive_token_ids, target_key: str = "calibration_target", eps: float = 1e-6):
-        token_ids = [int(t) for t in token_ids]
-        if len(set(token_ids)) != len(token_ids) or not token_ids:
-            raise ValueError("token_ids must be a non-empty list of unique ints")
-        self.token_ids = token_ids
-        self.positive_columns = [token_ids.index(int(t)) for t in positive_token_ids]
-        if not self.positive_columns:
-            raise ValueError("positive_token_ids must select at least one of token_ids")
+    def __init__(
+        self,
+        positive_token_ids,
+        negative_token_ids=None,
+        normalize_over: str = "token_set",
+        target_key: str = "calibration_target",
+    ):
+        self.positive_token_ids = tuple(int(t) for t in positive_token_ids)
+        self.negative_token_ids = None if negative_token_ids is None else tuple(int(t) for t in negative_token_ids)
+        if not self.positive_token_ids or len(set(self.positive_token_ids)) != len(self.positive_token_ids):
+            raise ValueError("positive_token_ids must be a non-empty list of unique ints")
+        if self.negative_token_ids is not None and set(self.negative_token_ids) & set(self.positive_token_ids):
+            raise ValueError("negative_token_ids must not overlap positive_token_ids")
+        if normalize_over not in ("token_set", "vocab"):
+            raise ValueError(f"normalize_over must be 'token_set' or 'vocab', got {normalize_over!r}")
+        self.normalize_over = normalize_over
         self.target_key = target_key
-        self.eps = float(eps)
         self.required_batch_keys = (target_key, "responses", "prompts")
+
+    def _columns(self, context: ActorObjectiveContext) -> tuple[list[int], list[int]]:
+        ids = list(context.selected_token_ids)
+        missing = [t for t in self.positive_token_ids if t not in ids]
+        if missing:
+            raise ValueError(
+                f"auxiliary objective '{context.name}': positive_token_ids {missing} are not in "
+                f"actor.selected_token_logprobs.token_ids {ids}"
+            )
+        pos = [ids.index(t) for t in self.positive_token_ids]
+        if self.normalize_over == "vocab":
+            return pos, []
+        negatives = self.negative_token_ids
+        if negatives is None:
+            negatives = tuple(t for t in ids if t not in self.positive_token_ids)
+        missing = [t for t in negatives if t not in ids]
+        if missing:
+            raise ValueError(
+                f"auxiliary objective '{context.name}': negative_token_ids {missing} are not in "
+                f"actor.selected_token_logprobs.token_ids {ids}"
+            )
+        if not negatives:
+            raise ValueError(
+                f"auxiliary objective '{context.name}': normalize_over='token_set' needs at least one negative "
+                "token id (add one to selected_token_logprobs.token_ids or pass negative_token_ids)"
+            )
+        return pos, [ids.index(t) for t in negatives]
 
     def _targets(self, data: TensorDict) -> torch.Tensor:
         target = data[self.target_key]
@@ -513,19 +613,12 @@ class SpecifiedTokenCalibrationObjective(BaseActorAuxiliaryObjective):
         """Count calibrated cells over the unsplit mini-batch."""
         return {"cells": float((self._targets(data) >= 0).sum().item())}
 
-    def process_logits(self, *, logits, data, context):
-        """Gather the requested columns of the full-vocabulary log-softmax."""
-        ids = torch.as_tensor(self.token_ids, device=logits.device)
-        lp = logits.index_select(-1, ids) - torch.logsumexp(logits, dim=-1, keepdim=True)
-        return {"logprobs": lp.float()}
-
     def compute(self, *, model_output, data, context) -> ActorObjectiveResult:
-        """BCE between the positive-column mass and the binary targets at calibrated cells."""
+        """BCE-with-logits between the positive-set logit and the binary targets at calibrated cells."""
         from verl.workers.utils.padding import no_padding_2_padding
 
-        lp = no_padding_2_padding(
-            model_output[f"{AUX_OUTPUT_PREFIX}/{context.name}/logprobs"], data
-        )  # (bsz, response_len, M)
+        pos_cols, neg_cols = self._columns(context)
+        lp = no_padding_2_padding(model_output[SELECTED_TOKEN_LOGPROBS_KEY], data)  # (bsz, response_len, M)
         target = self._targets(data).to(lp.device)
         if target.shape[1] < lp.shape[1]:
             pad = torch.full(
@@ -534,14 +627,28 @@ class SpecifiedTokenCalibrationObjective(BaseActorAuxiliaryObjective):
             target = torch.cat([target, pad], dim=1)
         target = target[:, : lp.shape[1]]
         mask = (target >= 0).float()
-        cols = torch.as_tensor(self.positive_columns, device=lp.device)
-        p = torch.exp(torch.logsumexp(lp.index_select(-1, cols), dim=-1)).clamp(self.eps, 1 - self.eps)
+        valid = mask > 0
+        lse_pos = torch.logsumexp(lp.index_select(-1, torch.as_tensor(pos_cols, device=lp.device)), dim=-1)
+        if neg_cols:
+            lse_neg = torch.logsumexp(lp.index_select(-1, torch.as_tensor(neg_cols, device=lp.device)), dim=-1)
+        else:
+            # Rest of the vocabulary: log(1 - exp(lse_pos)). Padded rows carry zeros (exp(0) = 1) and a
+            # saturated row would give log(0): neutralise both before the log so no NaN/inf enters the
+            # masked sum. The clamp only touches rows with p_pos > 1 - 1e-7.
+            neutral = torch.full_like(lse_pos, -math.log(2.0))
+            lse_pos = torch.where(valid, lse_pos, neutral).clamp(max=-1e-7)
+            lse_neg = torch.log(-torch.expm1(lse_pos))
+        z = lse_pos - lse_neg
         y = (target > 0).float()
-        bce = -(y * torch.log(p) + (1 - y) * torch.log1p(-p))
+        bce = F.binary_cross_entropy_with_logits(z, y, reduction="none")
         loss_sum = (bce * mask).sum()
         n_local = mask.sum().clamp(min=1.0)
         return ActorObjectiveResult(
             loss_sum=loss_sum,
             normalizer="cells",
-            metrics={"bce": (bce.detach() * mask).sum() / n_local, "cells_per_seq": mask.sum() / max(lp.shape[0], 1)},
+            metrics={
+                "bce": (bce.detach() * mask).sum() / n_local,
+                "positive_prob": (torch.sigmoid(z.detach()) * mask).sum() / n_local,
+                "cells_per_seq": mask.sum() / max(lp.shape[0], 1),
+            },
         )

@@ -98,6 +98,23 @@ def _scale_logits_by_temperature(logits, temperature, *, is_unit_temperature: bo
     return logits / temperature.clamp(min=1e-8).to(logits.dtype)
 
 
+def _selected_token_logprobs(logits: torch.Tensor, token_ids) -> torch.Tensor:
+    """Full-vocabulary log-softmax of ``logits`` gathered at ``token_ids``, as ``(rows, M)`` float32.
+
+    The engine-owned projection behind ``actor.selected_token_logprobs``: a row-wise function of the
+    (temperature-scaled) logits, so it is safe under sequence parallelism and packed padding, and the
+    only thing auxiliary objectives ever see of the logits. Its backward reads ``logits`` (logsumexp),
+    which is why callers must keep the cross-entropy backward out of place when it ran.
+    """
+    ids = torch.as_tensor(list(token_ids), device=logits.device, dtype=torch.long)
+    if int(ids.max().item()) >= logits.shape[-1]:
+        raise ValueError(
+            f"actor.selected_token_logprobs.token_ids contains id {int(ids.max().item())} but the model "
+            f"output vocabulary has {logits.shape[-1]} entries"
+        )
+    return (logits.index_select(-1, ids) - torch.logsumexp(logits, dim=-1, keepdim=True)).float()
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -729,9 +746,9 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
-        # Auxiliary objectives (see verl.workers.utils.auxiliary_objectives) prepare their global
-        # normalization statistics here, on the unsplit mini-batch, with one SUM over the DP group,
-        # exactly like batch_num_tokens above. Only the gradient-enabled update pass runs them.
+        # Auxiliary objectives (verl.workers.utils.auxiliary_objectives) prepare their global normalization
+        # statistics here, on the unsplit mini-batch, with one SUM over the DP group, like batch_num_tokens
+        # above. The composer is only installed on the actor's update path.
         prepare_global_stats = getattr(loss_function, "prepare_global_stats", None)
         if prepare_global_stats is not None and not forward_only:
             prepare_global_stats(data, dp_group=self.get_data_parallel_group())
@@ -1342,22 +1359,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
         )
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
         distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
+        # actor.selected_token_logprobs: emit the full-vocab log-softmax at these ids alongside log_probs.
+        selected_token_ids = tu.get_non_tensor_data(data=micro_batch, key="selected_token_ids", default=None) or None
+
+        if selected_token_ids and use_fused_kernels:
+            raise NotImplementedError(
+                "actor.selected_token_logprobs is not supported with use_fused_kernels=True: "
+                "fused kernels do not materialize the full logits tensor the projection needs."
+            )
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
                 "calculate_sum_pi_squared=True is not supported with use_fused_kernels=True: "
                 "fused kernels do not materialize the full logits tensor needed for Σπ²."
-            )
-
-        # Auxiliary-objective logits processors read the full logits of this forward; they only run on the
-        # gradient-enabled pass and are incompatible with fused kernels, which never materialize logits.
-        aux_process_logits = getattr(logits_processor_func, "process_logits", None)
-        if aux_process_logits is not None and not torch.is_grad_enabled():
-            aux_process_logits = None
-        if aux_process_logits is not None and use_fused_kernels:
-            raise NotImplementedError(
-                "auxiliary objectives with a logits processor are not supported with use_fused_kernels=True: "
-                "fused kernels do not materialize the full logits tensor the processor needs."
             )
 
         model_output = {}
@@ -1434,23 +1448,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         v = self._gather_and_unpad_packed(v, output_args["pad_size"])
                         model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
 
-                aux_outputs = None
-                if aux_process_logits is not None:
-                    aux_outputs = aux_process_logits(logits=logits_rmpad, data=micro_batch)
-                    cu_seqlens = input_ids.offsets()
-                    for k, v in aux_outputs.items():
-                        v = self._gather_and_unpad_packed(v, output_args["pad_size"])
-                        model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+                selected_rmpad = None
+                if selected_token_ids:
+                    selected_rmpad = _selected_token_logprobs(logits_rmpad, selected_token_ids)
 
                 if not distillation_only:
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
                         inplace_backward = False
-                    # The fused cross-entropy backward writes into the logits buffer in place; any processor
-                    # output whose backward still reads these logits (a logsumexp, say) would silently get
-                    # garbage gradients. Keep the buffer intact whenever a processor ran.
-                    if aux_outputs is not None:
+                    # The fused cross-entropy backward writes into the logits buffer in place; the projection's
+                    # logsumexp backward still reads it and would silently get garbage gradients.
+                    if selected_rmpad is not None:
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
@@ -1466,6 +1475,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 entropy_rmpad = self._gather_and_unpad_packed(entropy_rmpad, pad_size)
             if calculate_sum_pi_squared:
                 sum_pi_squared_rmpad = self._gather_and_unpad_packed(sum_pi_squared_rmpad, pad_size)
+            if selected_rmpad is not None:
+                selected_rmpad = self._gather_and_unpad_packed(selected_rmpad, pad_size)
 
             if pad_mode == DatasetPadMode.NO_PADDING:
                 cu_seqlens = input_ids.offsets()
@@ -1476,6 +1487,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
                 if calculate_sum_pi_squared:
                     sum_pi_squared = torch.nested.nested_tensor_from_jagged(sum_pi_squared_rmpad, cu_seqlens)
+                if selected_rmpad is not None:
+                    model_output["selected_token_logprobs"] = torch.nested.nested_tensor_from_jagged(
+                        selected_rmpad, cu_seqlens
+                    )
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -1544,19 +1559,20 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             )
                             model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
 
-                    aux_outputs = None
-                    if aux_process_logits is not None:
-                        aux_outputs = aux_process_logits(logits=logits_rmpad, data=micro_batch)
-                        for k, v in aux_outputs.items():
-                            model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+                    selected_rmpad = None
+                    if selected_token_ids:
+                        selected_rmpad = _selected_token_logprobs(logits_rmpad, selected_token_ids)
+                        model_output["selected_token_logprobs"] = torch.nested.nested_tensor_from_jagged(
+                            selected_rmpad, cu_seqlens
+                        )
 
                     log_probs = None
                     if not distillation_only:
-                        # inplace_backward=False when a processor ran: see the remove-padding branch above.
+                        # inplace_backward=False when the projection ran: see the remove-padding branch.
                         log_probs = logprobs_from_logits(
                             logits=logits_rmpad,
                             labels=input_ids_rmpad_rolled,
-                            inplace_backward=aux_outputs is None,
+                            inplace_backward=selected_rmpad is None,
                         )
 
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
