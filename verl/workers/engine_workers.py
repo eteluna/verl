@@ -52,6 +52,7 @@ from verl.workers.config import (
     TrainingWorkerConfig,
 )
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
+from verl.workers.utils.auxiliary_objectives import maybe_wrap_with_auxiliary_objectives
 from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
@@ -635,11 +636,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 assert self.config.rollout.log_prob_micro_batch_size_per_gpu is not None
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
             if self.distillation_enabled:
-                self.loss_fn = partial(
+                base_loss_fn = partial(
                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
                 )
             else:
-                self.loss_fn = partial(ppo_loss, config=actor_config)
+                base_loss_fn = partial(ppo_loss, config=actor_config)
+            # Identity when actor.auxiliary_objectives is empty (the default).
+            self.loss_fn = maybe_wrap_with_auxiliary_objectives(base_loss_fn, actor_config)
             self.actor = self.actor_worker_cls(config=actor_training_config)
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -34,6 +35,7 @@ from .optimizer import OptimizerConfig
 
 __all__ = [
     "PolicyLossConfig",
+    "AuxiliaryObjectiveConfig",
     "RouterReplayConfig",
     "ActorConfig",
     "FSDPActorConfig",
@@ -102,6 +104,40 @@ class PolicyLossConfig(BaseConfig):
 
 
 @dataclass
+class AuxiliaryObjectiveConfig(BaseConfig):
+    """One additive actor-side auxiliary objective.
+
+    Objectives are composed with the selected policy loss as ``L = L_pg + sum_i weight_i * L_i`` and
+    implemented by the protocol in :mod:`verl.workers.utils.auxiliary_objectives`.
+
+    Args:
+        name (str): Unique objective name. Metrics are published under ``actor/aux/<name>/``.
+        path (str): Python file defining the factory, loaded like ``custom_reward_function.path``.
+        factory (str): Callable in ``path`` returning the objective instance; called with ``**kwargs``.
+        weight (float): Coefficient applied exactly once by the framework. Must be finite; 0 still
+            executes the objective so its metrics stay available for ablations.
+        kwargs (dict[str, Any]): Keyword arguments forwarded to the factory.
+    """
+
+    name: str = MISSING
+    path: str = MISSING
+    factory: str = "build_objective"
+    weight: float = 1.0
+    kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Validate one objective entry."""
+        if not isinstance(self.name, str) or not self.name or self.name == MISSING:
+            raise ValueError(f"auxiliary objective name must be a non-empty string, got {self.name!r}")
+        if not isinstance(self.path, str) or not self.path or self.path == MISSING:
+            raise ValueError(f"auxiliary objective '{self.name}' needs a non-empty path, got {self.path!r}")
+        if not isinstance(self.factory, str) or not self.factory:
+            raise ValueError(f"auxiliary objective '{self.name}' needs a non-empty factory name")
+        if isinstance(self.weight, bool) or not isinstance(self.weight, int | float) or not math.isfinite(self.weight):
+            raise ValueError(f"auxiliary objective '{self.name}' weight must be a finite number, got {self.weight!r}")
+
+
+@dataclass
 class ActorConfig(BaseConfig):
     """Configuration for actor model training.
 
@@ -136,6 +172,8 @@ class ActorConfig(BaseConfig):
         optim (OptimizerConfig): Configuration for optimizer.
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
         data_loader_seed (int): Seed for data loader. If None, uses global seed.
+        auxiliary_objectives (list[AuxiliaryObjectiveConfig]): Additive actor-side objectives composed with
+            the policy loss. Empty by default, which leaves the actor loss untouched.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {
@@ -145,6 +183,7 @@ class ActorConfig(BaseConfig):
         "ppo_infer_micro_batch_size_per_gpu",
         "engine",
         "model_config",
+        "auxiliary_objectives",
     }
 
     strategy: str = MISSING
@@ -191,6 +230,7 @@ class ActorConfig(BaseConfig):
     # global_batch_size: global batch size
     global_batch_info: dict = field(default_factory=dict)
     qat: QATConfig = field(default_factory=QATConfig)
+    auxiliary_objectives: list[AuxiliaryObjectiveConfig] = field(default_factory=list)
 
     def __post_init__(self):
         """Validate actor configuration parameters."""
@@ -218,6 +258,20 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+        # Entries arrive as dataclasses (OmegaConf.structured) or plain mappings (hydra _target_ path).
+        coerced = []
+        for entry in self.auxiliary_objectives or []:
+            if isinstance(entry, AuxiliaryObjectiveConfig):
+                coerced.append(entry)
+            else:
+                entry = dict(entry)
+                entry.pop("_target_", None)
+                coerced.append(AuxiliaryObjectiveConfig(**entry))
+        names = [c.name for c in coerced]
+        if len(set(names)) != len(names):
+            raise ValueError(f"auxiliary objective names must be unique, got {names}")
+        self.auxiliary_objectives = coerced
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

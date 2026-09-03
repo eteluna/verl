@@ -729,6 +729,13 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
+        # Auxiliary objectives (see verl.workers.utils.auxiliary_objectives) prepare their global
+        # normalization statistics here, on the unsplit mini-batch, with one SUM over the DP group,
+        # exactly like batch_num_tokens above. Only the gradient-enabled update pass runs them.
+        prepare_global_stats = getattr(loss_function, "prepare_global_stats", None)
+        if prepare_global_stats is not None and not forward_only:
+            prepare_global_stats(data, dp_group=self.get_data_parallel_group())
+
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
@@ -1342,6 +1349,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "fused kernels do not materialize the full logits tensor needed for Σπ²."
             )
 
+        # Auxiliary-objective logits processors read the full logits of this forward; they only run on the
+        # gradient-enabled pass and are incompatible with fused kernels, which never materialize logits.
+        aux_process_logits = getattr(logits_processor_func, "process_logits", None)
+        if aux_process_logits is not None and not torch.is_grad_enabled():
+            aux_process_logits = None
+        if aux_process_logits is not None and use_fused_kernels:
+            raise NotImplementedError(
+                "auxiliary objectives with a logits processor are not supported with use_fused_kernels=True: "
+                "fused kernels do not materialize the full logits tensor the processor needs."
+            )
+
         model_output = {}
 
         # Some internal callers construct output_args directly instead of going
@@ -1416,10 +1434,23 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         v = self._gather_and_unpad_packed(v, output_args["pad_size"])
                         model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
 
+                aux_outputs = None
+                if aux_process_logits is not None:
+                    aux_outputs = aux_process_logits(logits=logits_rmpad, data=micro_batch)
+                    cu_seqlens = input_ids.offsets()
+                    for k, v in aux_outputs.items():
+                        v = self._gather_and_unpad_packed(v, output_args["pad_size"])
+                        model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+
                 if not distillation_only:
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
+                        inplace_backward = False
+                    # The fused cross-entropy backward writes into the logits buffer in place; any processor
+                    # output whose backward still reads these logits (a logsumexp, say) would silently get
+                    # garbage gradients. Keep the buffer intact whenever a processor ran.
+                    if aux_outputs is not None:
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
@@ -1513,9 +1544,20 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             )
                             model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
 
+                    aux_outputs = None
+                    if aux_process_logits is not None:
+                        aux_outputs = aux_process_logits(logits=logits_rmpad, data=micro_batch)
+                        for k, v in aux_outputs.items():
+                            model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+
                     log_probs = None
                     if not distillation_only:
-                        log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+                        # inplace_backward=False when a processor ran: see the remove-padding branch above.
+                        log_probs = logprobs_from_logits(
+                            logits=logits_rmpad,
+                            labels=input_ids_rmpad_rolled,
+                            inplace_backward=aux_outputs is None,
+                        )
 
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
                     if not distillation_only:
