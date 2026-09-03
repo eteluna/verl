@@ -114,14 +114,19 @@ model_output["selected_token_logprobs"]   # laid out like log_probs, trailing di
 ```
 
 It is computed row-wise from exactly the logits `log_probs` comes from, so it is correct under
-remove-padding, packed padding and Ulysses sequence parallelism, and it costs one `(tokens, M)`
-float32 tensor. Two things the engine handles for you:
+remove-padding, packed padding and Ulysses sequence parallelism.
 
-- **In-place cross-entropy backward.** verl's fused cross-entropy writes into the logits buffer during
-  backward; the projection's `logsumexp` backward still reads it. When the projection ran, the engine
-  keeps the buffer intact (`inplace_backward=False`), at the cost of one extra logits-sized buffer.
-- **Fused kernels.** `use_fused_kernels=True` never materializes the logits, so the projection cannot
-  run. Configuring both fails at initialization.
+**What it costs.** When the projection is on, the engine computes one fp32 `log_softmax` over the
+full vocabulary and gathers both `log_probs` (at the next-token labels) and the selected columns from
+it, through a custom autograd function that saves only the logits (like the fused cross-entropy does)
+and recomputes the softmax in backward: `grad = -softmax * sum(g) + scatter(g)`. So the price is one
+transient fp32 `[tokens, vocab]` buffer in forward and one in backward, no retained log-softmax, and the
+flash-attn fused cross-entropy is bypassed on that pass.
+The naive form (retain logits, out-of-place cross-entropy, separate `logsumexp`, `index_select`)
+measured +28 GB per GPU on a 152k-vocabulary model; the shared form is what ships. `use_fused_kernels=True`
+never materializes the logits, so the projection cannot run there and configuring both fails at
+initialization; a fused kernel that emits the selected columns inside the chunked cross-entropy is the
+follow-up.
 
 ## Reference objective: calibrating label tokens
 

@@ -98,13 +98,47 @@ def _scale_logits_by_temperature(logits, temperature, *, is_unit_temperature: bo
     return logits / temperature.clamp(min=1e-8).to(logits.dtype)
 
 
-def _selected_token_logprobs(logits: torch.Tensor, token_ids) -> torch.Tensor:
-    """Full-vocabulary log-softmax of ``logits`` gathered at ``token_ids``, as ``(rows, M)`` float32.
+class _LogSoftmaxSparseGather(torch.autograd.Function):
+    """``log_softmax(logits)`` gathered at per-row column indices, with a sparse backward.
 
-    The engine-owned projection behind ``actor.selected_token_logprobs``: a row-wise function of the
-    (temperature-scaled) logits, so it is safe under sequence parallelism and packed padding, and the
-    only thing auxiliary objectives ever see of the logits. Its backward reads ``logits`` (logsumexp),
-    which is why callers must keep the cross-entropy backward out of place when it ran.
+    Memory profile mirrors the fused cross-entropy kernel's: forward saves only the logits as given
+    (bf16 under mixed precision) and the index; the fp32 log-softmax is a transient of the forward.
+    Backward recomputes the softmax once and forms ``grad_logits = -softmax * sum_k(g_k) + scatter(g)``,
+    so no log-softmax buffer is retained and no per-consumer dense scatter is allocated. This is what lets
+    ``actor.selected_token_logprobs`` share one pass with ``log_probs`` instead of stacking a retained
+    logits buffer, an out-of-place cross-entropy gradient, a ``logsumexp`` backward temporary and an
+    ``index_select`` backward scatter on top of each other (measured at +28 GB/GPU for a 152k vocabulary).
+    """
+
+    @staticmethod
+    def forward(ctx, logits, index):
+        """logits: [rows, vocab]; index: long [rows, K] -> [rows, K] log-probabilities (fp32 for half inputs)."""
+        upcast = logits.dtype in (torch.float16, torch.bfloat16)
+        lsm = torch.log_softmax(logits.float() if upcast else logits, dim=-1)
+        out = lsm.gather(-1, index)
+        ctx.save_for_backward(logits, index)
+        ctx.upcast = upcast
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        """Sparse-upstream log-softmax backward from a recomputed softmax."""
+        logits, index = ctx.saved_tensors
+        probs = torch.softmax(logits.float() if ctx.upcast else logits, dim=-1)
+        grad_out = grad_out.to(probs.dtype)
+        grad_logits = probs.mul_(grad_out.sum(dim=-1, keepdim=True).neg())
+        grad_logits.scatter_add_(-1, index, grad_out)
+        return grad_logits.to(logits.dtype), None
+
+
+def _log_probs_and_selected_token_logprobs(logits: torch.Tensor, labels, token_ids):
+    """The engine-owned projection behind ``actor.selected_token_logprobs``, fused with the label gather.
+
+    Returns ``(log_probs [rows] or None, selected [rows, M] float32)``: full-vocabulary log-softmax of the
+    (temperature-scaled) logits at the next-token labels and at ``token_ids``, from one shared pass. It is
+    a row-wise function of the logits, so it is safe under sequence parallelism and packed padding, and
+    the only thing auxiliary objectives ever see of the logits. ``labels=None`` skips the label column
+    (distillation-only forwards).
     """
     ids = torch.as_tensor(list(token_ids), device=logits.device, dtype=torch.long)
     if int(ids.max().item()) >= logits.shape[-1]:
@@ -112,7 +146,14 @@ def _selected_token_logprobs(logits: torch.Tensor, token_ids) -> torch.Tensor:
             f"actor.selected_token_logprobs.token_ids contains id {int(ids.max().item())} but the model "
             f"output vocabulary has {logits.shape[-1]} entries"
         )
-    return (logits.index_select(-1, ids) - torch.logsumexp(logits, dim=-1, keepdim=True)).float()
+    rows = logits.shape[0]
+    cols = ids.unsqueeze(0).expand(rows, -1)
+    if labels is not None:
+        cols = torch.cat([labels.reshape(rows, 1).to(torch.long), cols], dim=-1)
+    out = _LogSoftmaxSparseGather.apply(logits, cols)
+    if labels is None:
+        return None, out.float()
+    return out[:, 0], out[:, 1:].float()
 
 
 class FSDPEngine(BaseEngine):
@@ -1450,16 +1491,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
                 selected_rmpad = None
                 if selected_token_ids:
-                    selected_rmpad = _selected_token_logprobs(logits_rmpad, selected_token_ids)
-
-                if not distillation_only:
+                    # One shared fp32 log-softmax with a sparse backward serves both log_probs and the
+                    # projection; the fused cross-entropy path is bypassed on this pass.
+                    log_probs, selected_rmpad = _log_probs_and_selected_token_logprobs(
+                        logits_rmpad, None if distillation_only else input_ids_rmpad_rolled, selected_token_ids
+                    )
+                elif not distillation_only:
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
-                        inplace_backward = False
-                    # The fused cross-entropy backward writes into the logits buffer in place; the projection's
-                    # logsumexp backward still reads it and would silently get garbage gradients.
-                    if selected_rmpad is not None:
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
@@ -1560,20 +1600,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
 
                     selected_rmpad = None
+                    log_probs = None
                     if selected_token_ids:
-                        selected_rmpad = _selected_token_logprobs(logits_rmpad, selected_token_ids)
+                        log_probs, selected_rmpad = _log_probs_and_selected_token_logprobs(
+                            logits_rmpad, None if distillation_only else input_ids_rmpad_rolled, selected_token_ids
+                        )
                         model_output["selected_token_logprobs"] = torch.nested.nested_tensor_from_jagged(
                             selected_rmpad, cu_seqlens
                         )
-
-                    log_probs = None
-                    if not distillation_only:
-                        # inplace_backward=False when the projection ran: see the remove-padding branch.
-                        log_probs = logprobs_from_logits(
-                            logits=logits_rmpad,
-                            labels=input_ids_rmpad_rolled,
-                            inplace_backward=selected_rmpad is None,
-                        )
+                    elif not distillation_only:
+                        log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
 
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
                     if not distillation_only:

@@ -14,10 +14,11 @@
 """The engine-owned selected-token projection in FSDPEngineWithLMHead.prepare_model_outputs.
 
 Covers: the projection is emitted, per sequence, on both the remove-padding and padded paths and only
-when the batch carries ``selected_token_ids``; the fused cross-entropy keeps its logits buffer intact
-(``inplace_backward=False``) whenever the projection ran; fused kernels and out-of-vocabulary ids are
-rejected; and the reference calibration objective produces the expected gradients and probabilities
-end to end in both normalization modes.
+when the batch carries ``selected_token_ids``; when it runs, ``log_probs`` comes from the same shared
+log-softmax (the fused cross-entropy is bypassed, not run out of place); the sparse backward matches
+autograd's reference; fused kernels and out-of-vocabulary ids are rejected; and the reference
+calibration objective produces the expected gradients and probabilities end to end in both
+normalization modes.
 """
 
 import math
@@ -30,7 +31,11 @@ from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 from verl.utils.torch_functional import logprobs_from_logits_v2
 from verl.workers.engine.fsdp import transformer_impl
-from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
+from verl.workers.engine.fsdp.transformer_impl import (
+    FSDPEngineWithLMHead,
+    _log_probs_and_selected_token_logprobs,
+    _LogSoftmaxSparseGather,
+)
 from verl.workers.utils.auxiliary_objectives import (
     AuxiliaryLossComposer,
     LoadedAuxiliaryObjective,
@@ -112,9 +117,11 @@ def _composer(objective, name="cal", selected=SELECTED):
 
 @pytest.fixture
 def record_inplace(monkeypatch):
+    """Record whether/how the fused cross-entropy helper was called."""
     seen = {}
 
     def fake(logits, labels, inplace_backward=True):
+        seen["called"] = True
         seen["inplace_backward"] = inplace_backward
         return logprobs_from_logits_v2(logits, labels)
 
@@ -122,8 +129,48 @@ def record_inplace(monkeypatch):
     return seen
 
 
+def _reference(logits, labels, ids):
+    lsm = torch.log_softmax(logits.float() if logits.dtype in (torch.float16, torch.bfloat16) else logits, dim=-1)
+    return lsm.gather(-1, labels.unsqueeze(-1)).squeeze(-1), lsm.index_select(-1, ids)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_shared_log_softmax_matches_reference_forward_and_backward(dtype):
+    torch.manual_seed(0)
+    rows = 9
+    logits = torch.randn(rows, VOCAB, dtype=dtype, requires_grad=True)
+    labels = torch.randint(0, VOCAB, (rows,))
+    ids = torch.tensor(SELECTED)
+
+    lp, sel = _log_probs_and_selected_token_logprobs(logits, labels, SELECTED)
+    ref_lp, ref_sel = _reference(logits.detach().clone().requires_grad_(True), labels, ids)
+    torch.testing.assert_close(lp.float(), ref_lp.float(), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(sel, ref_sel.float(), atol=1e-5, rtol=1e-5)
+
+    g_lp, g_sel = torch.randn(rows), torch.randn(rows, len(SELECTED))
+    (grad,) = torch.autograd.grad((lp.float() * g_lp).sum() + (sel * g_sel).sum(), logits)
+    ref_logits = logits.detach().clone().requires_grad_(True)
+    r_lp, r_sel = _reference(ref_logits, labels, ids)
+    (ref_grad,) = torch.autograd.grad((r_lp.float() * g_lp).sum() + (r_sel.float() * g_sel).sum(), ref_logits)
+    tol = 2e-3 if dtype == torch.bfloat16 else 1e-5
+    torch.testing.assert_close(grad.float(), ref_grad.float(), atol=tol, rtol=1e-3)
+
+
+def test_sparse_gather_passes_gradcheck():
+    torch.manual_seed(1)
+    logits = torch.randn(5, 7, dtype=torch.double, requires_grad=True)
+    index = torch.tensor([[0, 2, 3], [1, 2, 3], [6, 2, 3], [4, 2, 3], [2, 2, 3]])  # repeated columns on purpose
+    assert torch.autograd.gradcheck(lambda x: _LogSoftmaxSparseGather.apply(x, index), (logits,))
+
+
+def test_distillation_only_projection_has_no_label_column():
+    logits = torch.randn(4, VOCAB, requires_grad=True)
+    lp, sel = _log_probs_and_selected_token_logprobs(logits, None, SELECTED)
+    assert lp is None and sel.shape == (4, len(SELECTED)) and sel.requires_grad
+
+
 @pytest.mark.parametrize("use_remove_padding", [True, False])
-def test_projection_is_nested_per_sequence_and_ce_backward_is_out_of_place(record_inplace, use_remove_padding):
+def test_projection_is_nested_per_sequence_and_shares_the_log_softmax(record_inplace, use_remove_padding):
     torch.manual_seed(0)
     data = _micro_batch(use_remove_padding)
     param = torch.randn(64, VOCAB, requires_grad=True)
@@ -131,18 +178,18 @@ def test_projection_is_nested_per_sequence_and_ce_backward_is_out_of_place(recor
 
     model_output = _engine_stub().prepare_model_outputs(raw, args, data, logits_processor_func=None)
 
-    assert record_inplace["inplace_backward"] is False
+    # the fused cross-entropy helper is bypassed entirely when the projection is on
+    assert "called" not in record_inplace
     sel = model_output["selected_token_logprobs"]
     assert sel.is_nested
     assert [t.shape for t in sel.unbind()] == [
         (p + r, len(SELECTED)) for p, r in zip(PROMPT_LENS, RESP_LENS, strict=True)
     ]
-    assert sel.values().requires_grad
-    # columns are full-vocabulary log-softmax entries at the selected ids, in the configured order
-    ref = torch.log_softmax(param[: sel.values().shape[0]], dim=-1)[:, SELECTED] if use_remove_padding else None
-    if ref is not None:
-        torch.testing.assert_close(sel.values(), ref.float())
-    assert (sel.values().exp().sum(-1) <= 1 + 1e-5).all()
+    assert sel.values().requires_grad and model_output["log_probs"].values().requires_grad
+    total = sel.values().shape[0]
+    ref_lp, ref_sel = _reference(param[:total], args["input_ids_rmpad_rolled"], torch.tensor(SELECTED))
+    torch.testing.assert_close(sel.values(), ref_sel.float())
+    torch.testing.assert_close(model_output["log_probs"].values().float(), ref_lp)
 
 
 def test_no_flag_means_no_projection_and_in_place_backward(record_inplace):
@@ -151,7 +198,7 @@ def test_no_flag_means_no_projection_and_in_place_backward(record_inplace):
     raw, args = _raw_output_and_args(data, True, param)
     model_output = _engine_stub().prepare_model_outputs(raw, args, data, logits_processor_func=None)
     assert "selected_token_logprobs" not in model_output
-    assert record_inplace["inplace_backward"] is True
+    assert record_inplace["called"] and record_inplace["inplace_backward"] is True
 
 
 def test_fused_kernels_reject_projection():
