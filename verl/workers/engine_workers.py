@@ -52,6 +52,7 @@ from verl.workers.config import (
     TrainingWorkerConfig,
 )
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
+from verl.workers.utils.auxiliary_objectives import maybe_wrap_with_auxiliary_objectives
 from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
@@ -154,6 +155,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.flops_counter = None
 
         self.loss_fn = None
+        # actor.selected_token_logprobs.token_ids; stamped onto every train_batch as a non-tensor flag
+        self.selected_token_ids = None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -168,6 +171,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
         self.loss_fn = loss_fn
+
+    def set_selected_token_ids(self, token_ids):
+        """Token ids whose full-vocab log-probs the update forward emits as model_output['selected_token_logprobs']."""
+        # A tuple on purpose: tu.assign_non_tensor turns a list into a per-sample NonTensorStack.
+        self.selected_token_ids = tuple(int(t) for t in token_ids) if token_ids else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def reset(self):
@@ -355,6 +363,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
             use_fused_kernels=self.engine_config.use_fused_kernels,
         )
+        if self.selected_token_ids:
+            default_keys["selected_token_ids"] = self.selected_token_ids
 
         for key, val in default_keys.items():
             if key not in data.keys():
@@ -635,14 +645,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 assert self.config.rollout.log_prob_micro_batch_size_per_gpu is not None
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
             if self.distillation_enabled:
-                self.loss_fn = partial(
+                base_loss_fn = partial(
                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
                 )
             else:
-                self.loss_fn = partial(ppo_loss, config=actor_config)
+                base_loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = self.actor_worker_cls(config=actor_training_config)
             self.actor.reset()
+            # Auxiliary objectives: wrapped after the actor worker exists (its init creates the process
+            # group the cross-rank config handshake needs). Identity when the list is empty.
+            selected_token_ids = list(actor_config.selected_token_logprobs.token_ids)
+            if selected_token_ids and actor_training_config.engine_config.use_fused_kernels:
+                raise NotImplementedError(
+                    "actor.selected_token_logprobs requires use_fused_kernels=False: fused kernels never "
+                    "materialize the logits the projection reads."
+                )
+            self.loss_fn = maybe_wrap_with_auxiliary_objectives(
+                base_loss_fn,
+                actor_config,
+                available_model_outputs=self._available_actor_outputs(actor_config, distillation_config),
+            )
             self.actor.set_loss_fn(self.loss_fn)
+            self.actor.set_selected_token_ids(selected_token_ids)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
         # 3. build rollout engine
@@ -695,6 +719,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
+
+    @staticmethod
+    def _available_actor_outputs(actor_config, distillation_config) -> set[str]:
+        """model_output keys the configured actor-update forward produces, for objective validation."""
+        available = {"log_probs"}
+        if actor_config.calculate_entropy or actor_config.entropy_coeff != 0.0:
+            available.add("entropy")
+        if getattr(actor_config, "calculate_sum_pi_squared", False):
+            available.add("sum_pi_squared")
+        if actor_config.selected_token_logprobs.token_ids:
+            available.add("selected_token_logprobs")
+        if distillation_config is not None:
+            loss_cfg = distillation_config.distillation_loss
+            if loss_cfg.loss_settings.use_topk and not loss_cfg.use_task_rewards and not loss_cfg.use_policy_gradient:
+                available.discard("log_probs")  # distillation-only forward skips log_probs
+        return available
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")

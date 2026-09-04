@@ -98,6 +98,64 @@ def _scale_logits_by_temperature(logits, temperature, *, is_unit_temperature: bo
     return logits / temperature.clamp(min=1e-8).to(logits.dtype)
 
 
+class _LogSoftmaxSparseGather(torch.autograd.Function):
+    """``log_softmax(logits)`` gathered at per-row column indices, with a sparse backward.
+
+    Memory profile mirrors the fused cross-entropy kernel's: forward saves only the logits as given
+    (bf16 under mixed precision) and the index; the fp32 log-softmax is a transient of the forward.
+    Backward recomputes the softmax once and forms ``grad_logits = -softmax * sum_k(g_k) + scatter(g)``,
+    so no log-softmax buffer is retained and no per-consumer dense scatter is allocated. This is what lets
+    ``actor.selected_token_logprobs`` share one pass with ``log_probs`` instead of stacking a retained
+    logits buffer, an out-of-place cross-entropy gradient, a ``logsumexp`` backward temporary and an
+    ``index_select`` backward scatter on top of each other (measured at +28 GB/GPU for a 152k vocabulary).
+    """
+
+    @staticmethod
+    def forward(ctx, logits, index):
+        """logits: [rows, vocab]; index: long [rows, K] -> [rows, K] log-probabilities (fp32 for half inputs)."""
+        upcast = logits.dtype in (torch.float16, torch.bfloat16)
+        lsm = torch.log_softmax(logits.float() if upcast else logits, dim=-1)
+        out = lsm.gather(-1, index)
+        ctx.save_for_backward(logits, index)
+        ctx.upcast = upcast
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        """Sparse-upstream log-softmax backward from a recomputed softmax."""
+        logits, index = ctx.saved_tensors
+        probs = torch.softmax(logits.float() if ctx.upcast else logits, dim=-1)
+        grad_out = grad_out.to(probs.dtype)
+        grad_logits = probs.mul_(grad_out.sum(dim=-1, keepdim=True).neg())
+        grad_logits.scatter_add_(-1, index, grad_out)
+        return grad_logits.to(logits.dtype), None
+
+
+def _log_probs_and_selected_token_logprobs(logits: torch.Tensor, labels, token_ids):
+    """The engine-owned projection behind ``actor.selected_token_logprobs``, fused with the label gather.
+
+    Returns ``(log_probs [rows] or None, selected [rows, M] float32)``: full-vocabulary log-softmax of the
+    (temperature-scaled) logits at the next-token labels and at ``token_ids``, from one shared pass. It is
+    a row-wise function of the logits, so it is safe under sequence parallelism and packed padding, and
+    the only thing auxiliary objectives ever see of the logits. ``labels=None`` skips the label column
+    (distillation-only forwards).
+    """
+    ids = torch.as_tensor(list(token_ids), device=logits.device, dtype=torch.long)
+    if int(ids.max().item()) >= logits.shape[-1]:
+        raise ValueError(
+            f"actor.selected_token_logprobs.token_ids contains id {int(ids.max().item())} but the model "
+            f"output vocabulary has {logits.shape[-1]} entries"
+        )
+    rows = logits.shape[0]
+    cols = ids.unsqueeze(0).expand(rows, -1)
+    if labels is not None:
+        cols = torch.cat([labels.reshape(rows, 1).to(torch.long), cols], dim=-1)
+    out = _LogSoftmaxSparseGather.apply(logits, cols)
+    if labels is None:
+        return None, out.float()
+    return out[:, 0], out[:, 1:].float()
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -729,6 +787,13 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
+        # Auxiliary objectives (verl.workers.utils.auxiliary_objectives) prepare their global normalization
+        # statistics here, on the unsplit mini-batch, with one SUM over the DP group, like batch_num_tokens
+        # above. The composer is only installed on the actor's update path.
+        prepare_global_stats = getattr(loss_function, "prepare_global_stats", None)
+        if prepare_global_stats is not None and not forward_only:
+            prepare_global_stats(data, dp_group=self.get_data_parallel_group())
+
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
@@ -1335,6 +1400,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
         )
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
         distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
+        # actor.selected_token_logprobs: emit the full-vocab log-softmax at these ids alongside log_probs.
+        selected_token_ids = tu.get_non_tensor_data(data=micro_batch, key="selected_token_ids", default=None) or None
+
+        if selected_token_ids and use_fused_kernels:
+            raise NotImplementedError(
+                "actor.selected_token_logprobs is not supported with use_fused_kernels=True: "
+                "fused kernels do not materialize the full logits tensor the projection needs."
+            )
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1416,7 +1489,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         v = self._gather_and_unpad_packed(v, output_args["pad_size"])
                         model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
 
-                if not distillation_only:
+                selected_rmpad = None
+                if selected_token_ids:
+                    # One shared fp32 log-softmax with a sparse backward serves both log_probs and the
+                    # projection; the fused cross-entropy path is bypassed on this pass.
+                    log_probs, selected_rmpad = _log_probs_and_selected_token_logprobs(
+                        logits_rmpad, None if distillation_only else input_ids_rmpad_rolled, selected_token_ids
+                    )
+                elif not distillation_only:
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
@@ -1435,6 +1515,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 entropy_rmpad = self._gather_and_unpad_packed(entropy_rmpad, pad_size)
             if calculate_sum_pi_squared:
                 sum_pi_squared_rmpad = self._gather_and_unpad_packed(sum_pi_squared_rmpad, pad_size)
+            if selected_rmpad is not None:
+                selected_rmpad = self._gather_and_unpad_packed(selected_rmpad, pad_size)
 
             if pad_mode == DatasetPadMode.NO_PADDING:
                 cu_seqlens = input_ids.offsets()
@@ -1445,6 +1527,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
                 if calculate_sum_pi_squared:
                     sum_pi_squared = torch.nested.nested_tensor_from_jagged(sum_pi_squared_rmpad, cu_seqlens)
+                if selected_rmpad is not None:
+                    model_output["selected_token_logprobs"] = torch.nested.nested_tensor_from_jagged(
+                        selected_rmpad, cu_seqlens
+                    )
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -1513,8 +1599,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             )
                             model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
 
+                    selected_rmpad = None
                     log_probs = None
-                    if not distillation_only:
+                    if selected_token_ids:
+                        log_probs, selected_rmpad = _log_probs_and_selected_token_logprobs(
+                            logits_rmpad, None if distillation_only else input_ids_rmpad_rolled, selected_token_ids
+                        )
+                        model_output["selected_token_logprobs"] = torch.nested.nested_tensor_from_jagged(
+                            selected_rmpad, cu_seqlens
+                        )
+                    elif not distillation_only:
                         log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
 
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
