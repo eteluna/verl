@@ -15,7 +15,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
-from omegaconf import MISSING, DictConfig, OmegaConf
+from omegaconf import MISSING, DictConfig, ListConfig, OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
@@ -30,6 +30,7 @@ __all__ = [
     "TraceConfig",
     "ServerConfig",
     "PrometheusConfig",
+    "SelectedTokenLogprobsConfig",
     "RolloutConfig",
     "CheckpointEngineConfig",
 ]
@@ -141,6 +142,72 @@ class CheckpointEngineConfig(BaseConfig):
     custom_backend_module: Optional[str] = None
 
 
+_MAX_SELECTED_TOKEN_IDS = 128
+
+
+@dataclass
+class SelectedTokenLogprobsConfig(BaseConfig):
+    """Optional capture of rollout log probabilities for caller-selected token IDs.
+
+    ``token_ids`` enables the feature. ``positions`` restricts the captured
+    response positions; ``None`` keeps every response position. The values
+    follow ``rollout.logprobs_mode``.
+    """
+
+    token_ids: Optional[list[int]] = None
+    positions: Optional[list[int]] = None
+    max_payload_bytes_per_sample: int = 4 * 1024 * 1024
+
+    @property
+    def enabled(self) -> bool:
+        """Whether selected-token logprob capture is configured."""
+        return self.token_ids is not None
+
+    def __post_init__(self) -> None:
+        for field_name in ("token_ids", "positions"):
+            value = getattr(self, field_name)
+            if isinstance(value, ListConfig):
+                object.__setattr__(self, field_name, list(value))
+
+        limit = self.max_payload_bytes_per_sample
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("selected_token_logprobs.max_payload_bytes_per_sample must be a positive Python integer")
+
+        if not self.enabled:
+            if self.positions is not None:
+                raise ValueError("selected_token_logprobs.positions requires token_ids")
+            return
+
+        token_ids = self.token_ids
+        if not isinstance(token_ids, list) or not token_ids:
+            raise ValueError("selected_token_logprobs.token_ids must be a non-empty list")
+        for token_id in token_ids:
+            if type(token_id) is not int:
+                raise ValueError("selected_token_logprobs.token_ids must contain only Python integers")
+            if token_id < 0:
+                raise ValueError("selected_token_logprobs.token_ids must be non-negative")
+        if len(set(token_ids)) != len(token_ids):
+            raise ValueError("selected_token_logprobs.token_ids must be unique while preserving caller order")
+        if len(token_ids) > _MAX_SELECTED_TOKEN_IDS:
+            raise ValueError(
+                "selected_token_logprobs.token_ids exceeds the vLLM logprob_token_ids limit: "
+                f"{len(token_ids)} > {_MAX_SELECTED_TOKEN_IDS}"
+            )
+
+        positions = self.positions
+        if positions is None:
+            return
+        if not isinstance(positions, list) or not positions:
+            raise ValueError("selected_token_logprobs.positions must be null or a non-empty list")
+        for position in positions:
+            if type(position) is not int:
+                raise ValueError("selected_token_logprobs.positions must contain only Python integers")
+            if position < 0:
+                raise ValueError("selected_token_logprobs.positions must be non-negative")
+        if any(left >= right for left, right in zip(positions, positions[1:], strict=False)):
+            raise ValueError("selected_token_logprobs.positions must be unique and strictly increasing")
+
+
 @dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {
@@ -218,6 +285,8 @@ class RolloutConfig(BaseConfig):
 
     calculate_log_probs: bool = False
 
+    selected_token_logprobs: SelectedTokenLogprobsConfig = field(default_factory=SelectedTokenLogprobsConfig)
+
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
     trace: TraceConfig = field(default_factory=TraceConfig)
@@ -277,6 +346,27 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        # Hydra normally instantiates nested targets recursively. Direct callers
+        # and some Ray boundaries may still provide a dict/DictConfig, so keep
+        # this public config boundary explicit and fail closed.
+        if isinstance(self.selected_token_logprobs, dict):
+            object.__setattr__(
+                self,
+                "selected_token_logprobs",
+                SelectedTokenLogprobsConfig(**self.selected_token_logprobs),
+            )
+        elif not isinstance(self.selected_token_logprobs, SelectedTokenLogprobsConfig):
+            if not isinstance(self.selected_token_logprobs, DictConfig):
+                raise TypeError(
+                    "rollout.selected_token_logprobs must be dict, DictConfig, or "
+                    f"SelectedTokenLogprobsConfig; got {type(self.selected_token_logprobs).__name__}."
+                )
+            object.__setattr__(
+                self,
+                "selected_token_logprobs",
+                SelectedTokenLogprobsConfig(**OmegaConf.to_container(self.selected_token_logprobs, resolve=True)),
+            )
+
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(
@@ -342,3 +432,44 @@ class RolloutConfig(BaseConfig):
             raise ValueError(
                 f"rollout.disaggregation.enabled=True requires rollout.name in ('sglang', 'vllm'); got {self.name!r}."
             )
+
+        selected = self.selected_token_logprobs
+        if selected.enabled:
+            assert selected.token_ids is not None
+            if self.name != "vllm":
+                raise ValueError("selected_token_logprobs is currently supported only by rollout.name='vllm'")
+            if self.multi_turn.get("enable", False):
+                raise NotImplementedError("selected_token_logprobs does not yet support multi-turn rollout")
+            if self.agent.get("default_agent_loop", "single_turn_agent") != "single_turn_agent":
+                raise NotImplementedError(
+                    "selected_token_logprobs currently requires rollout.agent.default_agent_loop='single_turn_agent'"
+                )
+            if self.agent.get("agent_loop_config_path", None) is not None:
+                raise NotImplementedError(
+                    "selected_token_logprobs does not yet support rollout.agent.agent_loop_config_path"
+                )
+            if self.agent.get("agent_loop_manager_class", None) is not None:
+                raise NotImplementedError(
+                    "selected_token_logprobs does not yet support rollout.agent.agent_loop_manager_class"
+                )
+            if self.mtp is not None and self.mtp.get("enable_rollout", False):
+                raise NotImplementedError("selected_token_logprobs does not yet support speculative decoding")
+            if self.disaggregation.enabled:
+                raise NotImplementedError("selected_token_logprobs does not yet support prefill-decode disaggregation")
+            if type(self.response_length) is not int or self.response_length <= 0:
+                raise ValueError("selected_token_logprobs requires rollout.response_length to be a positive integer")
+            if selected.positions is not None and selected.positions[-1] >= self.response_length:
+                raise ValueError(
+                    "selected_token_logprobs.positions must be smaller than rollout.response_length, "
+                    f"got last position {selected.positions[-1]} and response_length {self.response_length}"
+                )
+
+            num_positions = len(selected.positions) if selected.positions is not None else self.response_length
+            num_token_ids = len(selected.token_ids)
+            # Per sample the payload owns an int32 [P] position array and a float32 [P, M] logprob matrix.
+            payload_bytes = num_positions * 4 + num_positions * num_token_ids * 4
+            if payload_bytes > selected.max_payload_bytes_per_sample:
+                raise ValueError(
+                    "selected_token_logprobs payload exceeds max_payload_bytes_per_sample: "
+                    f"{payload_bytes} > {selected.max_payload_bytes_per_sample}; raise the limit or restrict positions"
+                )

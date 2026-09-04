@@ -19,10 +19,11 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pprint import pprint
 from typing import Any, Callable, Optional
 
+import numpy as np
 import ray
 import vllm.entrypoints.cli.serve
 from packaging import version
@@ -53,6 +54,7 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.logprobs import SelectedTokenLogprobs, build_selected_token_logprobs
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import (
     get_max_position_embeddings,
@@ -82,6 +84,159 @@ if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _prepare_vllm_logprob_request(
+    sampling_params: dict[str, Any], requested_token_ids: Optional[Sequence[int]]
+) -> bool:
+    """Configure vLLM logprob fields and return whether sampled-token logprobs were requested."""
+
+    want_sampled_logprobs = bool(sampling_params.get("logprobs", False))
+    if requested_token_ids is None:
+        # Preserve the existing rollout contract: ``0`` asks vLLM only for the
+        # sampled token while ``None`` disables response logprobs altogether.
+        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        return want_sampled_logprobs
+
+    reserved_fields = ("logprob_token_ids", "flat_logprobs", "structured_outputs")
+    supplied_reserved_fields = [field for field in reserved_fields if field in sampling_params]
+    if supplied_reserved_fields:
+        raise ValueError(
+            "selected-token logprobs reserve these vLLM sampling fields and cannot accept caller-provided values: "
+            f"{supplied_reserved_fields}"
+        )
+
+    sampling_params.pop("logprobs", False)
+    # vLLM returns the sampled token in every row in addition to these exact
+    # token IDs. Setting ``logprobs`` to the number of requested IDs would also
+    # enable top-k capture, which is both unnecessary and more expensive.
+    sampling_params["logprobs"] = None
+    sampling_params["logprob_token_ids"] = list(requested_token_ids)
+    return want_sampled_logprobs
+
+
+def _read_vllm_logprob_cell(cell: Any, *, response_position: int, token_id: int) -> float:
+    try:
+        return float(cell.logprob)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"vLLM returned an invalid logprob cell at response position {response_position} for token ID {token_id}"
+        ) from error
+
+
+def _extract_vllm_logprob_rows(
+    response_token_ids: Sequence[int],
+    logprob_rows: Optional[Sequence[Mapping[int, Any]]],
+    *,
+    want_sampled_logprobs: bool,
+    requested_token_ids: Optional[Sequence[int]],
+) -> tuple[Optional[list[float]], Optional[np.ndarray]]:
+    """Extract sampled-token scalars and, when enabled, a dense exact-token matrix."""
+
+    if requested_token_ids is None:
+        if not want_sampled_logprobs:
+            return None, None
+        if logprob_rows is None:
+            raise RuntimeError("vLLM did not return sampled-token logprobs for a request that asked for them")
+        # Keep the disabled-feature behavior equivalent to the pre-feature
+        # implementation, including looking up each sampled token by token ID.
+        sampled_logprobs = [
+            _read_vllm_logprob_cell(
+                row[response_token_ids[index]],
+                response_position=index,
+                token_id=response_token_ids[index],
+            )
+            for index, row in enumerate(logprob_rows)
+        ]
+        return sampled_logprobs, None
+
+    if logprob_rows is None:
+        raise RuntimeError("vLLM did not return logprob rows for enabled selected-token logprobs")
+    if len(logprob_rows) != len(response_token_ids):
+        raise RuntimeError(
+            "vLLM returned a different number of logprob rows and response tokens: "
+            f"{len(logprob_rows)} != {len(response_token_ids)}"
+        )
+
+    dense_logprobs = np.empty((len(response_token_ids), len(requested_token_ids)), dtype=np.float32)
+    sampled_logprobs = [] if want_sampled_logprobs else None
+    for response_position, (sampled_token_id, row) in enumerate(zip(response_token_ids, logprob_rows, strict=True)):
+        if not isinstance(row, Mapping):
+            raise RuntimeError(
+                "vLLM returned a non-mapping logprob row at response position "
+                f"{response_position}: {type(row).__name__}"
+            )
+
+        # Validate and materialize every backend row before the common helper
+        # gathers configured positions. A missing cell at an unretained position
+        # is therefore still a hard error rather than silently hidden.
+        for column, requested_token_id in enumerate(requested_token_ids):
+            if requested_token_id not in row:
+                raise RuntimeError(
+                    "vLLM omitted a requested logprob cell at response position "
+                    f"{response_position} for token ID {requested_token_id}"
+                )
+            dense_logprobs[response_position, column] = _read_vllm_logprob_cell(
+                row[requested_token_id],
+                response_position=response_position,
+                token_id=requested_token_id,
+            )
+
+        if sampled_logprobs is not None:
+            if sampled_token_id not in row:
+                raise RuntimeError(
+                    "vLLM omitted the sampled-token logprob at response position "
+                    f"{response_position} for token ID {sampled_token_id}"
+                )
+            sampled_logprobs.append(
+                _read_vllm_logprob_cell(
+                    row[sampled_token_id],
+                    response_position=response_position,
+                    token_id=sampled_token_id,
+                )
+            )
+
+    return sampled_logprobs, dense_logprobs
+
+
+def _build_vllm_selected_token_logprobs(
+    dense_logprobs: np.ndarray,
+    configured_positions: Optional[Sequence[int]],
+    *,
+    token_ids: Sequence[int],
+    response_ids: Sequence[int],
+    logprobs_mode: str,
+) -> SelectedTokenLogprobs:
+    return build_selected_token_logprobs(
+        dense_logprobs,
+        configured_positions,
+        token_ids=token_ids,
+        response_ids=response_ids,
+        logprobs_mode=logprobs_mode,
+        backend="vllm",
+        backend_version=str(vllm.__version__),
+    )
+
+
+def _vllm_supports_logprob_token_ids() -> bool:
+    struct_fields = getattr(SamplingParams, "__struct_fields__", None)
+    if struct_fields is not None:
+        return "logprob_token_ids" in struct_fields
+    try:
+        return "logprob_token_ids" in inspect.signature(SamplingParams).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _get_hf_vocab_size(hf_config: Any) -> int:
+    vocab_size = getattr(hf_config, "vocab_size", None)
+    if vocab_size is None:
+        text_config = getattr(hf_config, "text_config", None)
+        if text_config is not None:
+            vocab_size = getattr(text_config, "vocab_size", None)
+    if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise ValueError("selected-token logprobs require a positive integer vocab_size in the Hugging Face config")
+    return vocab_size
 
 
 class vLLMHttpServer:
@@ -584,6 +739,13 @@ class vLLMHttpServer:
 
         prompt_ids = normalize_token_ids(prompt_ids)
 
+        selected_config = self.config.selected_token_logprobs
+        selected_enabled = selected_config.enabled
+        requested_token_ids = tuple(selected_config.token_ids) if selected_enabled else None
+        configured_positions = None
+        if selected_enabled and selected_config.positions is not None:
+            configured_positions = tuple(selected_config.positions)
+
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
         # (see vllm.sampling_params.SamplingParams._verify_args), so we require at
@@ -617,7 +779,7 @@ class vLLMHttpServer:
         assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        want_sampled_logprobs = _prepare_vllm_logprob_request(sampling_params, requested_token_ids)
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
@@ -692,9 +854,20 @@ class vLLMHttpServer:
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
         if not final_res.outputs:
+            selected_token_logprobs = None
+            if selected_enabled:
+                assert requested_token_ids is not None
+                selected_token_logprobs = _build_vllm_selected_token_logprobs(
+                    np.empty((0, len(requested_token_ids)), dtype=np.float32),
+                    configured_positions,
+                    token_ids=requested_token_ids,
+                    response_ids=(),
+                    logprobs_mode=self._effective_logprobs_mode(),
+                )
             return TokenOutput(
                 token_ids=[],
                 log_probs=None,
+                selected_token_logprobs=selected_token_logprobs,
                 routed_experts=None,
                 stop_reason="aborted",
                 extra_fields=extra_fields,
@@ -709,9 +882,23 @@ class vLLMHttpServer:
             result_dict=extra_fields,
         )
         token_ids = final_res.outputs[0].token_ids
-        log_probs = None
-        if sampling_params.logprobs is not None:
-            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+        log_probs, dense_selected_logprobs = _extract_vllm_logprob_rows(
+            token_ids,
+            final_res.outputs[0].logprobs,
+            want_sampled_logprobs=want_sampled_logprobs,
+            requested_token_ids=requested_token_ids,
+        )
+        selected_token_logprobs = None
+        if selected_enabled:
+            assert requested_token_ids is not None
+            assert dense_selected_logprobs is not None
+            selected_token_logprobs = _build_vllm_selected_token_logprobs(
+                dense_selected_logprobs,
+                configured_positions,
+                token_ids=requested_token_ids,
+                response_ids=tuple(token_ids),
+                logprobs_mode=self._effective_logprobs_mode(),
+            )
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -752,6 +939,7 @@ class vLLMHttpServer:
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
+            selected_token_logprobs=selected_token_logprobs,
             routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
@@ -1076,6 +1264,53 @@ class vLLMHttpServer:
                 f"{self.config.max_num_batched_tokens} to {self.config.max_model_len}."
             )
             self.config.max_num_batched_tokens = self.config.max_model_len
+
+        selected_config = self.config.selected_token_logprobs
+        if not selected_config.enabled:
+            return
+
+        minimum_version = version.parse("0.20.0")
+        if _VLLM_VERSION < minimum_version:
+            raise RuntimeError(
+                "selected-token logprobs require vLLM>=0.20.0 for SamplingParams.logprob_token_ids; "
+                f"found vLLM {vllm.__version__}"
+            )
+        if not _vllm_supports_logprob_token_ids():
+            raise RuntimeError(
+                "the installed vLLM SamplingParams API does not expose logprob_token_ids, "
+                "which is required for selected-token logprobs"
+            )
+
+        vocab_size = _get_hf_vocab_size(self.model_config.hf_config)
+        assert selected_config.token_ids is not None
+        out_of_range_token_ids = [token_id for token_id in selected_config.token_ids if token_id >= vocab_size]
+        if out_of_range_token_ids:
+            raise ValueError(
+                "selected_token_logprobs.token_ids must be smaller than the model vocabulary size "
+                f"({vocab_size}); out-of-range values: {out_of_range_token_ids}"
+            )
+
+        engine_kwargs = self.config.get("engine_kwargs", {}) or {}
+        vllm_engine_kwargs = engine_kwargs.get(self._get_engine_kwargs_key(), {}) or {}
+        normalized_engine_kwargs = {
+            key.replace("-", "_"): value for key, value in vllm_engine_kwargs.items() if value is not None
+        }
+        speculative_keys = {"speculative_config", "spec_method", "spec_model", "spec_tokens"}
+        configured_speculative_keys = sorted(speculative_keys & normalized_engine_kwargs.keys())
+        if configured_speculative_keys:
+            raise NotImplementedError(
+                "selected-token logprobs do not yet support vLLM speculative decoding; remove these keys from "
+                f"rollout.engine_kwargs.vllm: {configured_speculative_keys}"
+            )
+
+    def _effective_logprobs_mode(self) -> str:
+        """The vLLM logprobs mode in force for this server, honouring an engine_kwargs override."""
+        engine_kwargs = self.config.get("engine_kwargs", {}) or {}
+        vllm_engine_kwargs = engine_kwargs.get(self._get_engine_kwargs_key(), {}) or {}
+        for key, value in vllm_engine_kwargs.items():
+            if key.replace("-", "_") == "logprobs_mode" and value is not None:
+                return str(value)
+        return str(self.config.logprobs_mode)
 
     def _post_init(self, cuda_visible_devices: str) -> None:
         """Called at the end of __init__. Default logs server metadata."""

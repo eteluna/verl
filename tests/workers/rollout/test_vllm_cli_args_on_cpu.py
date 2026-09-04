@@ -15,6 +15,7 @@
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 # vllm is not part of the `cpu` extra (it conflicts with the cpu torch world), so
@@ -25,6 +26,12 @@ from verl.workers.rollout.vllm_rollout.utils import (
     _resolve_vllm_weight_sync_local_rank,
     build_cli_args_from_config,
     vLLMColocateWorkerExtension,
+)
+from verl.workers.rollout.vllm_rollout.vllm_async_server import (
+    _build_vllm_selected_token_logprobs,
+    _extract_vllm_logprob_rows,
+    _prepare_vllm_logprob_request,
+    vLLMHttpServer,
 )
 
 
@@ -254,6 +261,308 @@ class TestVllmColocateZmqHandle:
         handle = vLLMColocateWorkerExtension._get_zmq_handle(worker)
 
         assert handle == "ipc:///tmp/rl-colocate-zmq-job-123-replica-2-rank-3.sock"
+
+
+def _logprob(value: float) -> SimpleNamespace:
+    return SimpleNamespace(logprob=value)
+
+
+def _exact_logprob_rows():
+    # Deliberately vary insertion order. The parser must use token IDs and the
+    # caller's requested-token order, never backend mapping order.
+    return [
+        {3: _logprob(-3.1), 10: _logprob(-0.1), 7: _logprob(-7.1)},
+        {20: _logprob(-0.2), 7: _logprob(-7.2), 3: _logprob(-3.2), 10: _logprob(-10.2)},
+    ]
+
+
+@pytest.mark.parametrize("exact_enabled", [False, True])
+@pytest.mark.parametrize("want_sampled_logprobs", [False, True])
+def test_selected_token_request_and_parse_2x2(exact_enabled, want_sampled_logprobs):
+    requested_token_ids = (7, 10, 3) if exact_enabled else None
+    params = {"temperature": 0.5, "logprobs": want_sampled_logprobs}
+
+    sampled_requested = _prepare_vllm_logprob_request(params, requested_token_ids)
+
+    assert sampled_requested is want_sampled_logprobs
+    assert params["temperature"] == 0.5
+    if exact_enabled:
+        assert params["logprobs"] is None
+        assert params["logprob_token_ids"] == [7, 10, 3]
+        rows = _exact_logprob_rows()
+    else:
+        assert params["logprobs"] == (0 if want_sampled_logprobs else None)
+        assert "logprob_token_ids" not in params
+        rows = [{10: _logprob(-0.1)}, {20: _logprob(-0.2)}] if want_sampled_logprobs else None
+
+    sampled_logprobs, dense_logprobs = _extract_vllm_logprob_rows(
+        [10, 20],
+        rows,
+        want_sampled_logprobs=sampled_requested,
+        requested_token_ids=requested_token_ids,
+    )
+
+    if want_sampled_logprobs:
+        assert sampled_logprobs == pytest.approx([-0.1, -0.2])
+    else:
+        assert sampled_logprobs is None
+    if exact_enabled:
+        assert dense_logprobs is not None
+        assert dense_logprobs.dtype == np.float32
+        np.testing.assert_allclose(
+            dense_logprobs,
+            np.array([[-7.1, -0.1, -3.1], [-7.2, -10.2, -3.2]], dtype=np.float32),
+        )
+    else:
+        assert dense_logprobs is None
+
+
+@pytest.mark.parametrize(
+    ("reserved_field", "reserved_value"),
+    [
+        ("logprob_token_ids", [1]),
+        ("flat_logprobs", False),
+        ("structured_outputs", None),
+    ],
+)
+def test_selected_token_request_rejects_caller_reserved_fields(reserved_field, reserved_value):
+    params = {"logprobs": True, reserved_field: reserved_value}
+
+    with pytest.raises(ValueError, match=reserved_field):
+        _prepare_vllm_logprob_request(params, (7, 3))
+
+
+def test_disabled_feature_does_not_claim_or_rewrite_exact_token_fields():
+    params = {
+        "logprobs": True,
+        "logprob_token_ids": [7],
+        "flat_logprobs": True,
+        "structured_outputs": None,
+    }
+
+    assert _prepare_vllm_logprob_request(params, None) is True
+    assert params == {
+        "logprobs": 0,
+        "logprob_token_ids": [7],
+        "flat_logprobs": True,
+        "structured_outputs": None,
+    }
+
+
+def test_selected_token_parser_validates_unretained_dense_rows():
+    rows = _exact_logprob_rows()
+    del rows[1][3]
+
+    # A later sparse gather might retain only response position zero, but the
+    # backend adapter must still reject the missing cell in dense row one.
+    with pytest.raises(RuntimeError, match="response position 1.*token ID 3"):
+        _extract_vllm_logprob_rows(
+            [10, 20],
+            rows,
+            want_sampled_logprobs=False,
+            requested_token_ids=(7, 10, 3),
+        )
+
+
+def test_selected_token_parser_rejects_missing_sampled_cell_only_when_requested():
+    rows = [{7: _logprob(-7.1), 3: _logprob(-3.1)}]
+
+    sampled_logprobs, dense_logprobs = _extract_vllm_logprob_rows(
+        [10],
+        rows,
+        want_sampled_logprobs=False,
+        requested_token_ids=(7, 3),
+    )
+    assert sampled_logprobs is None
+    assert dense_logprobs is not None
+
+    with pytest.raises(RuntimeError, match="sampled-token logprob.*token ID 10"):
+        _extract_vllm_logprob_rows(
+            [10],
+            rows,
+            want_sampled_logprobs=True,
+            requested_token_ids=(7, 3),
+        )
+
+
+@pytest.mark.parametrize("row_count", [0, 2])
+def test_selected_token_parser_requires_one_dense_row_per_response_token(row_count):
+    rows = [{7: _logprob(-7.1)} for _ in range(row_count)]
+
+    with pytest.raises(RuntimeError, match="different number of logprob rows"):
+        _extract_vllm_logprob_rows(
+            [10],
+            rows,
+            want_sampled_logprobs=False,
+            requested_token_ids=(7,),
+        )
+
+
+def test_vllm_payload_builder_handles_short_and_empty_responses_with_provenance():
+    short_payload = _build_vllm_selected_token_logprobs(
+        np.array([[-7.1, -3.1]], dtype=np.float32),
+        [0, 2],
+        token_ids=(7, 3),
+        response_ids=(10,),
+        logprobs_mode="processed_logprobs",
+    )
+    empty_payload = _build_vllm_selected_token_logprobs(
+        np.empty((0, 2), dtype=np.float32),
+        [0, 2],
+        token_ids=(7, 3),
+        response_ids=(),
+        logprobs_mode="processed_logprobs",
+    )
+
+    assert short_payload.backend == "vllm"
+    assert short_payload.backend_version
+    assert short_payload.logprobs_mode == "processed_logprobs"
+    assert short_payload.response_ids == (10,)
+    assert short_payload.positions.tolist() == [0]
+    assert short_payload.logprobs.shape == (1, 2)
+    assert empty_payload.response_token_count == 0
+    assert empty_payload.positions.shape == (0,)
+    assert empty_payload.logprobs.shape == (0, 2)
+
+
+class _AttrDict(dict):
+    __getattr__ = dict.__getitem__
+    __setattr__ = dict.__setitem__
+
+
+def _server_for_config_validation(*, token_ids, engine_kwargs=None):
+    server = object.__new__(vLLMHttpServer)
+    server.config = _AttrDict(
+        max_model_len=32,
+        enable_chunked_prefill=True,
+        max_num_batched_tokens=32,
+        logprobs_mode="processed_logprobs",
+        selected_token_logprobs=SimpleNamespace(enabled=token_ids is not None, token_ids=token_ids),
+        engine_kwargs=engine_kwargs or {},
+    )
+    server.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(max_position_embeddings=32, vocab_size=100, _commit_hash="model-commit")
+    )
+    return server
+
+
+class _AbortingEngine:
+    def __init__(self):
+        self.sampling_params = None
+
+    async def generate(self, *, sampling_params, **kwargs):
+        del kwargs
+        self.sampling_params = sampling_params
+        yield SimpleNamespace(outputs=[])
+
+
+@pytest.mark.asyncio
+async def test_generate_abort_returns_present_empty_selected_token_payload(monkeypatch):
+    monkeypatch.delenv("VERL_RL_INSIGHT_ENABLE", raising=False)
+    server = object.__new__(vLLMHttpServer)
+    server._disaggregation_role = "null"
+    server._pd_decode_peers = []
+    server.config = _AttrDict(
+        max_model_len=32,
+        prompt_length=8,
+        response_length=8,
+        full_determinism=False,
+        repetition_penalty=1.0,
+        ignore_eos=False,
+        logprobs_mode="processed_logprobs",
+        engine_kwargs={},
+        selected_token_logprobs=SimpleNamespace(enabled=True, token_ids=[7, 3], positions=[0, 2]),
+    )
+    server.model_config = SimpleNamespace(processor=None, hf_config=SimpleNamespace(), lora_rank=0, lora={})
+    server.global_steps = 5
+    server.replica_rank = 0
+    server._submission_paused = False
+    server._admitting = 0
+    server.engine = _AbortingEngine()
+
+    output = await server.generate(
+        prompt_ids=[1, 2],
+        sampling_params={"logprobs": False, "max_tokens": 2},
+        request_id="abort-test",
+    )
+
+    assert output.stop_reason == "aborted"
+    assert output.selected_token_logprobs is not None
+    assert output.selected_token_logprobs.response_token_count == 0
+    assert output.selected_token_logprobs.positions.shape == (0,)
+    assert output.selected_token_logprobs.logprobs.shape == (0, 2)
+    assert output.selected_token_logprobs.response_ids == ()
+    assert output.selected_token_logprobs.logprobs_mode == "processed_logprobs"
+    assert server.engine.sampling_params.logprobs is None
+    assert server.engine.sampling_params.logprob_token_ids == [7, 3]
+
+
+def test_selected_token_config_validation_checks_vocab_bounds():
+    server = _server_for_config_validation(token_ids=[7, 100])
+
+    with pytest.raises(ValueError, match="out-of-range values.*100"):
+        server._validate_configs()
+
+
+@pytest.mark.parametrize(
+    ("engine_key", "engine_value"),
+    [
+        ("speculative_config", {"method": "ngram"}),
+        ("speculative-config", {"method": "ngram"}),
+        ("spec_method", "ngram"),
+        ("spec-method", "ngram"),
+        ("spec_model", "draft-model"),
+        ("spec-model", "draft-model"),
+        ("spec_tokens", 3),
+        ("spec-tokens", 3),
+    ],
+)
+def test_selected_token_config_validation_rejects_engine_speculative_config(engine_key, engine_value):
+    server = _server_for_config_validation(
+        token_ids=[7],
+        engine_kwargs={"vllm": {engine_key: engine_value}},
+    )
+
+    with pytest.raises(NotImplementedError, match="speculative decoding"):
+        server._validate_configs()
+
+
+@pytest.mark.parametrize("engine_key", ["logprobs_mode", "logprobs-mode"])
+def test_effective_logprobs_mode_honours_engine_override(engine_key):
+    server = _server_for_config_validation(token_ids=[7], engine_kwargs={"vllm": {engine_key: "raw_logits"}})
+
+    assert server._effective_logprobs_mode() == "raw_logits"
+    assert _server_for_config_validation(token_ids=[7])._effective_logprobs_mode() == "processed_logprobs"
+
+
+def test_selected_token_config_validation_requires_vllm_020(monkeypatch):
+    import verl.workers.rollout.vllm_rollout.vllm_async_server as server_module
+
+    server = _server_for_config_validation(token_ids=[7])
+    monkeypatch.setattr(server_module, "_VLLM_VERSION", server_module.version.parse("0.19.0"))
+
+    with pytest.raises(RuntimeError, match="vLLM>=0.20.0"):
+        server._validate_configs()
+
+
+def test_selected_token_config_validation_checks_sampling_params_capability(monkeypatch):
+    import verl.workers.rollout.vllm_rollout.vllm_async_server as server_module
+
+    server = _server_for_config_validation(token_ids=[7])
+    monkeypatch.setattr(server_module, "_vllm_supports_logprob_token_ids", lambda: False)
+
+    with pytest.raises(RuntimeError, match="does not expose logprob_token_ids"):
+        server._validate_configs()
+
+
+def test_disabled_feature_skips_exact_token_capability_gates(monkeypatch):
+    import verl.workers.rollout.vllm_rollout.vllm_async_server as server_module
+
+    server = _server_for_config_validation(token_ids=None)
+    monkeypatch.setattr(server_module, "_VLLM_VERSION", server_module.version.parse("0.1.0"))
+    monkeypatch.setattr(server_module, "_vllm_supports_logprob_token_ids", lambda: False)
+
+    server._validate_configs()
 
 
 if __name__ == "__main__":

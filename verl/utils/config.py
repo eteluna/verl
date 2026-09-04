@@ -86,6 +86,34 @@ def validate_config(
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
+    rollout_config = config.actor_rollout_ref.rollout
+    selected_token_config = rollout_config.get("selected_token_logprobs", None)
+    selected_token_logprobs_enabled = (
+        selected_token_config is not None and selected_token_config.get("token_ids", None) is not None
+    )
+    if selected_token_logprobs_enabled:
+        reward_config = getattr(config, "reward", None)
+        if reward_config is None:
+            raise ValueError("selected-token logprobs require the reward configuration")
+        reward_model_config = reward_config.get("reward_model", None)
+        if reward_model_config is None:
+            raise ValueError("selected-token logprobs require reward.reward_model configuration")
+        reward_num_workers = reward_config.get("num_workers", None)
+        if type(reward_num_workers) is not int or reward_num_workers <= 0:
+            raise ValueError("selected-token logprobs require reward.num_workers to be a positive Python integer")
+        reward_model_enabled = reward_model_config.get("enable", False)
+        if reward_model_enabled and not reward_model_config.get("enable_resource_pool", False):
+            raise NotImplementedError(
+                "selected-token logprobs require streaming reward workers; an enabled colocated reward model "
+                "with reward.reward_model.enable_resource_pool=False is not supported"
+            )
+        custom_reward_config = reward_config.get("custom_reward_function", {}) or {}
+        if reward_model_enabled and custom_reward_config.get("path", None) is None:
+            raise NotImplementedError(
+                "selected-token logprobs cannot be consumed by the built-in discriminative reward model path; "
+                "configure reward.custom_reward_function"
+            )
+
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":
             model_parallel_size = (

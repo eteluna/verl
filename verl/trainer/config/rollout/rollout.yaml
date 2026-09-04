@@ -92,6 +92,24 @@ enable_prefix_caching: True
 # logprobs mode for rollout logprobs
 logprobs_mode: processed_logprobs
 
+# Optional log probabilities of caller-selected token IDs at response positions.
+# Setting token_ids enables capture. Values follow rollout.logprobs_mode. The first
+# revision supports single-turn vLLM rollout and hands the payload to the reward function.
+selected_token_logprobs:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.SelectedTokenLogprobsConfig
+
+  # Caller-ordered token IDs whose log probabilities are captured (maximum 128). null disables capture.
+  token_ids: null
+
+  # Optional unique, strictly increasing, zero-based response positions to keep.
+  # null keeps every response position.
+  positions: null
+
+  # Maximum ndarray bytes transported per sample (int32 [P] positions + float32 [P, M] logprobs).
+  max_payload_bytes_per_sample: 4194304
+
 # scheduling policy for vllm rollout
 scheduling_policy: fcfs
 

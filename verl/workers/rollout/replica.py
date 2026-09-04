@@ -27,6 +27,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.logprobs import SelectedTokenLogprobs
 
 logger = logging.getLogger(__file__)
 
@@ -41,6 +42,8 @@ class TokenOutput(BaseModel):
     """response token ids"""
     log_probs: Optional[list[float]] = None
     """logprobs of response token ids"""
+    selected_token_logprobs: Optional[SelectedTokenLogprobs] = None
+    """Log probabilities of the selected token ids at the captured response positions."""
     routed_experts: Optional[Any] = None
     """routed experts of response token ids"""
     stop_reason: Optional[str] = None
