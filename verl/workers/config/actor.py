@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -34,6 +35,8 @@ from .optimizer import OptimizerConfig
 
 __all__ = [
     "PolicyLossConfig",
+    "AuxiliaryObjectiveConfig",
+    "SelectedTokenLogprobsConfig",
     "RouterReplayConfig",
     "ActorConfig",
     "FSDPActorConfig",
@@ -102,6 +105,72 @@ class PolicyLossConfig(BaseConfig):
 
 
 @dataclass
+class AuxiliaryObjectiveConfig(BaseConfig):
+    """One additive actor-side auxiliary objective.
+
+    Objectives are composed with the selected policy loss as ``L = L_pg + sum_i weight_i * L_i`` and
+    implemented by the protocol in :mod:`verl.workers.utils.auxiliary_objectives`.
+
+    Args:
+        name (str): Unique objective name. Metrics are published under ``actor/aux/<name>/``.
+        path (str): Python file defining the factory, loaded like ``custom_reward_function.path``.
+        factory (str): Callable in ``path`` returning the objective instance; called with ``**kwargs``.
+        weight (float): Coefficient applied exactly once by the framework. Must be finite. An objective
+            with ``weight == 0`` is skipped entirely unless ``metrics_only`` is set.
+        metrics_only (bool): Run the objective under ``no_grad`` for its metrics only; it never
+            contributes to the loss. The way to keep ablation metrics without paying for the graph.
+        kwargs (dict[str, Any]): Keyword arguments forwarded to the factory.
+    """
+
+    name: str = MISSING
+    path: str = MISSING
+    factory: str = "build_objective"
+    weight: float = 1.0
+    metrics_only: bool = False
+    kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Validate one objective entry."""
+        if not isinstance(self.name, str) or not self.name or self.name == MISSING:
+            raise ValueError(f"auxiliary objective name must be a non-empty string, got {self.name!r}")
+        if not isinstance(self.path, str) or not self.path or self.path == MISSING:
+            raise ValueError(f"auxiliary objective '{self.name}' needs a non-empty path, got {self.path!r}")
+        if not isinstance(self.factory, str) or not self.factory:
+            raise ValueError(f"auxiliary objective '{self.name}' needs a non-empty factory name")
+        if isinstance(self.weight, bool) or not isinstance(self.weight, int | float) or not math.isfinite(self.weight):
+            raise ValueError(f"auxiliary objective '{self.name}' weight must be a finite number, got {self.weight!r}")
+        if not isinstance(self.metrics_only, bool):
+            raise ValueError(f"auxiliary objective '{self.name}' metrics_only must be a bool")
+
+
+@dataclass
+class SelectedTokenLogprobsConfig(BaseConfig):
+    """Engine-owned projection of the actor logits onto a fixed set of token ids.
+
+    When ``token_ids`` is non-empty, every actor-update forward also emits
+    ``model_output["selected_token_logprobs"]``: the full-vocabulary log-softmax (after temperature
+    scaling, like ``log_probs``) gathered at those ids, laid out like ``log_probs`` with a trailing
+    dimension of ``len(token_ids)`` in the given order. Consumed by auxiliary objectives. Requires
+    ``use_fused_kernels=False``.
+
+    Args:
+        token_ids (list[int]): Unique, non-negative token ids. Empty disables the projection.
+    """
+
+    token_ids: list[int] = field(default_factory=list)
+
+    def __post_init__(self):
+        """Validate the token id list."""
+        ids = list(self.token_ids or [])
+        if any(isinstance(t, bool) or not isinstance(t, int) or t < 0 for t in ids):
+            raise ValueError(f"selected_token_logprobs.token_ids must be non-negative ints, got {ids}")
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"selected_token_logprobs.token_ids must be unique, got {ids}")
+        if len(ids) > 1024:
+            raise ValueError(f"selected_token_logprobs.token_ids is capped at 1024 entries, got {len(ids)}")
+
+
+@dataclass
 class ActorConfig(BaseConfig):
     """Configuration for actor model training.
 
@@ -136,6 +205,10 @@ class ActorConfig(BaseConfig):
         optim (OptimizerConfig): Configuration for optimizer.
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
         data_loader_seed (int): Seed for data loader. If None, uses global seed.
+        auxiliary_objectives (list[AuxiliaryObjectiveConfig]): Additive actor-side objectives composed with
+            the policy loss. Empty by default, which leaves the actor loss untouched.
+        selected_token_logprobs (SelectedTokenLogprobsConfig): Engine-owned selected-token projection
+            emitted for auxiliary objectives. Off by default.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {
@@ -145,6 +218,7 @@ class ActorConfig(BaseConfig):
         "ppo_infer_micro_batch_size_per_gpu",
         "engine",
         "model_config",
+        "auxiliary_objectives",
     }
 
     strategy: str = MISSING
@@ -191,6 +265,8 @@ class ActorConfig(BaseConfig):
     # global_batch_size: global batch size
     global_batch_info: dict = field(default_factory=dict)
     qat: QATConfig = field(default_factory=QATConfig)
+    auxiliary_objectives: list[AuxiliaryObjectiveConfig] = field(default_factory=list)
+    selected_token_logprobs: SelectedTokenLogprobsConfig = field(default_factory=SelectedTokenLogprobsConfig)
 
     def __post_init__(self):
         """Validate actor configuration parameters."""
@@ -218,6 +294,24 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+        # Entries arrive as dataclasses (OmegaConf.structured) or plain mappings (hydra _target_ path).
+        coerced = []
+        for entry in self.auxiliary_objectives or []:
+            if isinstance(entry, AuxiliaryObjectiveConfig):
+                coerced.append(entry)
+            else:
+                entry = dict(entry)
+                entry.pop("_target_", None)
+                coerced.append(AuxiliaryObjectiveConfig(**entry))
+        names = [c.name for c in coerced]
+        if len(set(names)) != len(names):
+            raise ValueError(f"auxiliary objective names must be unique, got {names}")
+        self.auxiliary_objectives = coerced
+        if not isinstance(self.selected_token_logprobs, SelectedTokenLogprobsConfig):
+            entry = dict(self.selected_token_logprobs or {})
+            entry.pop("_target_", None)
+            object.__setattr__(self, "selected_token_logprobs", SelectedTokenLogprobsConfig(**entry))
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

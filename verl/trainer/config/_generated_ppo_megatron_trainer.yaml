@@ -145,6 +145,10 @@ actor_rollout_ref:
       strict: true
       mbridge_config: {}
     use_fused_kernels: ${oc.select:actor_rollout_ref.model.use_fused_kernels,false}
+    auxiliary_objectives: []
+    selected_token_logprobs:
+      _target_: verl.workers.config.SelectedTokenLogprobsConfig
+      token_ids: []
     profiler:
       _target_: verl.utils.profiler.ProfilerConfig
       tool: ${oc.select:global_profiler.tool,null}
