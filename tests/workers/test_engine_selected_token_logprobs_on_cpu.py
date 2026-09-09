@@ -201,6 +201,55 @@ def test_no_flag_means_no_projection_and_in_place_backward(record_inplace):
     assert record_inplace["called"] and record_inplace["inplace_backward"] is True
 
 
+@pytest.mark.parametrize("use_remove_padding", [True, False])
+@pytest.mark.parametrize("calculate_entropy", [True, False])
+def test_fused_kernels_without_projection_preserve_outputs_and_gradients(use_remove_padding, calculate_entropy):
+    data = _micro_batch(use_remove_padding=use_remove_padding, selected=None, use_fused_kernels=True)
+    tu.assign_non_tensor(data, calculate_entropy=calculate_entropy)
+    seq_lengths = [p + r for p, r in zip(PROMPT_LENS, RESP_LENS, strict=True)]
+    total = sum(seq_lengths)
+    shape = (1, total) if use_remove_padding else (len(seq_lengths), max(seq_lengths))
+    log_probs = torch.randn(shape, requires_grad=True)
+    entropy = torch.rand(shape, requires_grad=True)
+    # Fused outputs have no logits: the disabled projection must consume the existing outputs directly.
+    raw = SimpleNamespace(log_probs=log_probs, entropy=entropy)
+    args = {
+        "input_ids_rmpad_rolled": torch.roll(data["input_ids"].values(), shifts=-1, dims=0),
+        "temperature_rmpad": torch.ones(total),
+        "pad_size": 0,
+    }
+
+    model_output = _engine_stub().prepare_model_outputs(raw, args, data, logits_processor_func=None)
+
+    expected_keys = {"log_probs", "entropy"} if calculate_entropy else {"log_probs"}
+    assert set(model_output) == expected_keys
+    loss = 0
+    for key in expected_keys:
+        source = getattr(raw, key)
+        expected_rows = (
+            source.squeeze(0).split(seq_lengths)
+            if use_remove_padding
+            else [row[:length] for row, length in zip(source, seq_lengths, strict=True)]
+        )
+        actual = model_output[key]
+        assert actual.is_nested
+        torch.testing.assert_close(actual.offsets(), data["input_ids"].offsets())
+        for actual_row, expected_row in zip(actual.unbind(), expected_rows, strict=True):
+            torch.testing.assert_close(actual_row, expected_row)
+        loss = loss + actual.values().sum()
+
+    loss.backward()
+    expected_grad = torch.ones_like(log_probs)
+    if not use_remove_padding:
+        for row, length in zip(expected_grad, seq_lengths, strict=True):
+            row[length:] = 0
+    torch.testing.assert_close(log_probs.grad, expected_grad)
+    if calculate_entropy:
+        torch.testing.assert_close(entropy.grad, expected_grad)
+    else:
+        assert entropy.grad is None
+
+
 def test_fused_kernels_reject_projection():
     data = _micro_batch(use_remove_padding=True, use_fused_kernels=True)
     raw, args = _raw_output_and_args(data, True, torch.randn(64, VOCAB))

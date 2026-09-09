@@ -1427,6 +1427,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         if use_remove_padding:
             input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
             temperature_rmpad = output_args["temperature_rmpad"]
+            selected_rmpad = None
 
             if use_fused_kernels:
                 # temperature is singleton
@@ -1489,7 +1490,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         v = self._gather_and_unpad_packed(v, output_args["pad_size"])
                         model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
 
-                selected_rmpad = None
                 if selected_token_ids:
                     # One shared fp32 log-softmax with a sparse backward serves both log_probs and the
                     # projection; the fused cross-entropy path is bypassed on this pass.
